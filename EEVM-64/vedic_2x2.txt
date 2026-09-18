@@ -1,0 +1,56 @@
+1) // =============================================================================
+// Module   : vedic_2x2
+// Project  : EEVM-64 - Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.4
+// Level    : Combinational, gate-level (base case of the recursive hierarchy)
+//
+// Function : 2-bit x 2-bit unsigned Urdhva-Tiryakbhyam multiplier, built
+//            explicitly from two half-adders (no '*' operator inference -
+//            this is the literal bit-level Vedic decomposition that every
+//            larger vedic_NxN level is recursively built on top of).
+//
+//   p0            = a0 . b0
+//   {c1,s1} = HA( a1.b0 , a0.b1 )     -- cross terms, vertically-crosswise
+//   {c2,s2} = HA( a1.b1 , c1     )
+//   p = {c2, s2, s1, p0}
+//
+// Notes for synthesis:
+//   - Pure continuous-assignment gate expressions -> maps 1:1 to AND/XOR
+//     cells (Vivado) or SkyWater130 std cells (Yosys) without algebraic
+//     restructuring, which keeps this block a faithful, measurable Vedic
+//     primitive rather than a synthesizer-optimized generic multiplier.
+//   - No clock, no reset: purely combinational leaf module.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module vedic_2x2 (
+    input  logic [1:0] a,   // a[1] = MSB, a[0] = LSB
+    input  logic [1:0] b,   // b[1] = MSB, b[0] = LSB
+    output logic [3:0] p    // p[3] = MSB, p[0] = LSB
+);
+
+    // ---- partial (vertical/crosswise) bit products -------------------------
+    logic p_a0b0;   // vertical term (bit 0)
+    logic p_a1b0;   // crosswise term
+    logic p_a0b1;   // crosswise term
+    logic p_a1b1;   // vertical term (bit 2, into HA2)
+
+    assign p_a0b0 = a[0] & b[0];
+    assign p_a1b0 = a[1] & b[0];
+    assign p_a0b1 = a[0] & b[1];
+    assign p_a1b1 = a[1] & b[1];
+
+    // ---- Half Adder 1: sums the two crosswise terms -----------------------
+    logic s1, c1;
+    assign s1 = p_a1b0 ^ p_a0b1;
+    assign c1 = p_a1b0 & p_a0b1;
+
+    // ---- Half Adder 2: folds HA1's carry into the vertical MSB term -------
+    logic s2, c2;
+    assign s2 = p_a1b1 ^ c1;
+    assign c2 = p_a1b1 & c1;
+
+    // ---- Result assembly ----------------------------------------------------
+    assign p = {c2, s2, s1, p_a0b0};
+
+endmodule
