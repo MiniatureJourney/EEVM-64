@@ -1,0 +1,41 @@
+// =============================================================================
+// Module   : compressor_3to2
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.6
+// Level    : Combinational, parameterized width
+//
+// Function : W-wide array of independent, per-bit full adders (a "3:2
+//            compressor"). Each bit position n is reduced completely
+//            independently — there is NO carry propagation between bit
+//            positions within this module:
+//
+//              sum[n]   = x[n] ^ y[n] ^ z[n]
+//              carry[n] = majority(x[n], y[n], z[n])
+//
+//            The carry output is a same-width vector in carry-save form:
+//            each carry[n] logically carries weight 2^(n+1), so it must be
+//            shifted left by one bit when later combined with sum (this is
+//            handled downstream by prefix_adder, not here).
+//
+// Reuse    : This is the base primitive compressor_4to2 cascades twice
+//            (per bit, at WIDTH=1) per EEVM-64_architecturePlan.pdf §2.7.
+//            It is also instantiated directly, at the tree's natural width,
+//            wherever a plain 3-row partial-product reduction is needed.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module compressor_3to2 #(
+    parameter int WIDTH = 8
+) (
+    input  logic [WIDTH-1:0] x,
+    input  logic [WIDTH-1:0] y,
+    input  logic [WIDTH-1:0] z,
+    output logic [WIDTH-1:0] sum,
+    output logic [WIDTH-1:0] carry
+);
+
+    // Vectorized bitwise ops == WIDTH independent full adders in parallel.
+    assign sum   = x ^ y ^ z;
+    assign carry = (x & y) | (y & z) | (x & z);
+
+endmodule
