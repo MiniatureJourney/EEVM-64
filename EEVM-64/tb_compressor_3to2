@@ -1,0 +1,84 @@
+// =============================================================================
+// Testbench : tb_compressor_3to2
+// DUT       : compressor_3to2
+//
+// Method    : Two DUT instances for two different coverage strategies:
+//               - WIDTH=1  : exhaustive, all 8 (x,y,z) combinations. This is
+//                             exactly the shape compressor_4to2 will reuse
+//                             internally as its per-bit cell, so proving it
+//                             correct at W=1 is a direct precondition for
+//                             Block 3.
+//               - WIDTH=8  : 2000 randomized vectors, checked bit-by-bit
+//                             against a behavioral (loop-based) golden model,
+//                             representative of the wider widths this module
+//                             will see inside the vedic_NxN combine stages.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_compressor_3to2;
+
+    // ---- Instance A: WIDTH=1, exhaustive ------------------------------------
+    logic x1, y1, z1, sum1, carry1;
+
+    compressor_3to2 #(.WIDTH(1)) dut_w1 (
+        .x(x1), .y(y1), .z(z1),
+        .sum(sum1), .carry(carry1)
+    );
+
+    // ---- Instance B: WIDTH=8, randomized ------------------------------------
+    localparam int WB = 8;
+    logic [WB-1:0] x8, y8, z8, sum8, carry8;
+
+    compressor_3to2 #(.WIDTH(WB)) dut_w8 (
+        .x(x8), .y(y8), .z(z8),
+        .sum(sum8), .carry(carry8)
+    );
+
+    integer errors;
+    integer i, bi;
+    logic [WB-1:0] exp_sum8, exp_carry8;
+
+    initial begin
+        $dumpfile("tb_compressor_3to2.vcd");
+        $dumpvars(0, tb_compressor_3to2);
+        errors = 0;
+
+        // ---- exhaustive W=1 sweep -------------------------------------------
+        for (i = 0; i < 8; i = i + 1) begin
+            {x1, y1, z1} = i[2:0];
+            #2;
+            if (sum1 !== (x1 ^ y1 ^ z1) ||
+                carry1 !== ((x1 & y1) | (y1 & z1) | (x1 & z1))) begin
+                errors = errors + 1;
+                $display("FAIL (W=1): x=%0b y=%0b z=%0b -> sum=%0b carry=%0b",
+                          x1, y1, z1, sum1, carry1);
+            end
+        end
+
+        // ---- randomized W=8 sweep -------------------------------------------
+        for (i = 0; i < 2000; i = i + 1) begin
+            x8 = $urandom;
+            y8 = $urandom;
+            z8 = $urandom;
+            #2;
+            for (bi = 0; bi < WB; bi = bi + 1) begin
+                exp_sum8[bi]   = x8[bi] ^ y8[bi] ^ z8[bi];
+                exp_carry8[bi] = (x8[bi] & y8[bi]) | (y8[bi] & z8[bi]) | (x8[bi] & z8[bi]);
+            end
+            if (sum8 !== exp_sum8 || carry8 !== exp_carry8) begin
+                errors = errors + 1;
+                $display("FAIL (W=8): x=%0h y=%0h z=%0h -> sum=%0h carry=%0h (expected sum=%0h carry=%0h)",
+                          x8, y8, z8, sum8, carry8, exp_sum8, exp_carry8);
+            end
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: compressor_3to2 - 8/8 exhaustive (W=1) + 2000/2000 randomized (W=8) vectors correct.");
+        else
+            $display("FAIL: compressor_3to2 - %0d mismatches found.", errors);
+
+        $finish;
+    end
+
+endmodule
