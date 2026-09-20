@@ -1,0 +1,115 @@
+// =============================================================================
+// Module   : brent_kung_adder
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.8, §3.5 ("primary/default")
+// Level    : Combinational, parameterized width
+//
+// Function : Brent-Kung parallel-prefix adder. Trades a bit more depth
+//            than Kogge-Stone for a "regular layout" (Brent & Kung 1982,
+//            ref [8]) — much lower fan-out, the reason it's chosen as the
+//            primary adder for this energy/area-conscious design.
+//
+// Width generalization — design decision:
+//   Brent-Kung's classic two-phase (up-sweep/down-sweep) tree is only
+//   naturally regular for power-of-2 widths, but this design needs
+//   widths 4/6/10/18/34 (EEVM-64_architecturePlan.pdf §2.5). This module
+//   pads a,b up to NPAD = next power of 2 >= WIDTH and runs the standard
+//   algorithm there. This is exact, not approximate:
+//     - zero-extending a,b gives every padding bit g=a&b=0, p=a^b=0
+//       ("inert": generates nothing, propagates nothing) with no special
+//       casing needed;
+//     - the prefix-combine operator only ever folds a LOWER index into a
+//       HIGHER one, never the reverse, so no real output bit (index <
+//       WIDTH) can ever be computed using a padding bit's (g,p) as a
+//       source — real bits only ever combine with other real bits.
+//   The padded tree is therefore bit-exact identical to a true
+//   native-width tree for every real output bit. The extra padding
+//   logic doesn't drive any real output, so synthesis should eliminate
+//   it — confirm this from the Vivado utilization report rather than
+//   assume it silently.
+//
+// Structure (N = NPAD, 0-indexed, verified by hand for N=4 and N=8):
+//   Up-sweep,   level L = 1..log2(N), stride=2^L, half=2^(L-1):
+//     for i = stride-1; i < N; i += stride: (g,p)[i] o= (g,p)[i-half]
+//   Down-sweep, level L = log2(N)-1 downto 1, stride=2^L, half=2^(L-1):
+//     for i = stride+half-1; i < N; i += stride: (g,p)[i] o= (g,p)[i-half]
+//   where (g,p) o (g',p') = (g | (p & g'), p & p').
+// =============================================================================
+`timescale 1ns / 1ps
+
+module brent_kung_adder #(
+    parameter int WIDTH = 8
+) (
+    input  logic [WIDTH-1:0] a,
+    input  logic [WIDTH-1:0] b,
+    input  logic             cin,
+    output logic [WIDTH-1:0] sum,
+    output logic             cout
+);
+
+    localparam int KSTAGE     = $clog2(WIDTH);          // up-sweep stages
+    localparam int NPAD       = 1 << KSTAGE;             // next power of 2 >= WIDTH
+    localparam int DOWN_STAGES = (KSTAGE > 1) ? (KSTAGE - 1) : 0;
+    localparam int TOTAL      = KSTAGE + DOWN_STAGES;    // final stage index
+
+    logic [NPAD-1:0] a_pad, b_pad;
+    assign a_pad = {{(NPAD-WIDTH){1'b0}}, a};
+    assign b_pad = {{(NPAD-WIDTH){1'b0}}, b};
+
+    logic [NPAD-1:0] g [0:TOTAL];
+    logic [NPAD-1:0] p [0:TOTAL];
+
+    assign g[0] = a_pad & b_pad;
+    assign p[0] = a_pad ^ b_pad;
+
+    genvar lvl, idx, dlvl;
+
+    // ---- up-sweep: stages 1..KSTAGE, builds the binary tree upward ---------
+    generate
+        for (lvl = 1; lvl <= KSTAGE; lvl = lvl + 1) begin : up
+            localparam int STRIDE = 1 << lvl;
+            localparam int HALF   = 1 << (lvl - 1);
+            for (idx = 0; idx < NPAD; idx = idx + 1) begin : bit_
+                if ((idx >= STRIDE - 1) && (((idx - (STRIDE - 1)) % STRIDE) == 0)) begin : combine_
+                    assign g[lvl][idx] = g[lvl-1][idx] | (p[lvl-1][idx] & g[lvl-1][idx-HALF]);
+                    assign p[lvl][idx] = p[lvl-1][idx] & p[lvl-1][idx-HALF];
+                end else begin : passthru_
+                    assign g[lvl][idx] = g[lvl-1][idx];
+                    assign p[lvl][idx] = p[lvl-1][idx];
+                end
+            end
+        end
+    endgenerate
+
+    // ---- down-sweep: fills in the intermediate prefixes the tree skipped ---
+    generate
+        for (dlvl = 0; dlvl < DOWN_STAGES; dlvl = dlvl + 1) begin : down
+            localparam int STAGE_IDX = KSTAGE + 1 + dlvl;
+            localparam int LEVEL     = KSTAGE - 1 - dlvl;
+            localparam int STRIDE    = 1 << LEVEL;
+            localparam int HALF      = 1 << (LEVEL - 1);
+            for (idx = 0; idx < NPAD; idx = idx + 1) begin : bit_
+                if ((idx >= STRIDE + HALF - 1) && (((idx - (STRIDE + HALF - 1)) % STRIDE) == 0)) begin : combine_
+                    assign g[STAGE_IDX][idx] = g[STAGE_IDX-1][idx] | (p[STAGE_IDX-1][idx] & g[STAGE_IDX-1][idx-HALF]);
+                    assign p[STAGE_IDX][idx] = p[STAGE_IDX-1][idx] & p[STAGE_IDX-1][idx-HALF];
+                end else begin : passthru_
+                    assign g[STAGE_IDX][idx] = g[STAGE_IDX-1][idx];
+                    assign p[STAGE_IDX][idx] = p[STAGE_IDX-1][idx];
+                end
+            end
+        end
+    endgenerate
+
+    logic [NPAD-1:0] c;   // c[i] = carry OUT of bit i
+    assign c = g[TOTAL] | (p[TOTAL] & {NPAD{cin}});
+
+    assign sum[0] = p[0][0] ^ cin;
+    generate
+        for (idx = 1; idx < WIDTH; idx = idx + 1) begin : sumbit
+            assign sum[idx] = p[0][idx] ^ c[idx-1];
+        end
+    endgenerate
+
+    assign cout = c[WIDTH-1];
+
+endmodule
