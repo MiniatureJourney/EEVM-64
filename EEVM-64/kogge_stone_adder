@@ -1,0 +1,73 @@
+// =============================================================================
+// Module   : kogge_stone_adder
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.8, §3.5 ("speed baseline")
+// Level    : Combinational, parameterized width
+//
+// Function : Kogge-Stone parallel-prefix adder. Minimum depth
+//            (ceil(log2(WIDTH)) stages) at the cost of high fan-out —
+//            the deliberate trade-off against brent_kung_adder.
+//
+// Structure: Standard generate/propagate prefix network:
+//              g0[i] = a[i] & b[i]      (bit generates a carry)
+//              p0[i] = a[i] ^ b[i]      (bit propagates a carry)
+//            Stage s (s=1..ceil(log2(WIDTH))), offset = 2^(s-1):
+//              for i >= offset: (g,p)[i] = (g,p)[i] o (g,p)[i-offset]
+//              for i <  offset: unchanged
+//            where (g,p) o (g',p') = (g | (p & g'), p & p').
+//            This per-bit-index doubling needs NO power-of-2 width
+//            assumption — it is already correct for any WIDTH using
+//            ceil(log2(WIDTH)) stages, unlike Brent-Kung's tree shape.
+//
+//            Final: c[i] = G[i] | (P[i] & cin), c[-1] = cin
+//                   sum[i] = p0[i] ^ c[i-1],  cout = c[WIDTH-1]
+// =============================================================================
+`timescale 1ns / 1ps
+
+module kogge_stone_adder #(
+    parameter int WIDTH = 8
+) (
+    input  logic [WIDTH-1:0] a,
+    input  logic [WIDTH-1:0] b,
+    input  logic             cin,
+    output logic [WIDTH-1:0] sum,
+    output logic             cout
+);
+
+    localparam int STAGES = $clog2(WIDTH);
+
+    logic [WIDTH-1:0] g [0:STAGES];
+    logic [WIDTH-1:0] p [0:STAGES];
+
+    assign g[0] = a & b;
+    assign p[0] = a ^ b;
+
+    genvar s, i;
+    generate
+        for (s = 1; s <= STAGES; s = s + 1) begin : stage
+            localparam int OFFSET = 1 << (s - 1);
+            for (i = 0; i < WIDTH; i = i + 1) begin : bit_
+                if (i >= OFFSET) begin : combine_
+                    assign g[s][i] = g[s-1][i] | (p[s-1][i] & g[s-1][i-OFFSET]);
+                    assign p[s][i] = p[s-1][i] & p[s-1][i-OFFSET];
+                end else begin : passthru_
+                    assign g[s][i] = g[s-1][i];
+                    assign p[s][i] = p[s-1][i];
+                end
+            end
+        end
+    endgenerate
+
+    logic [WIDTH-1:0] c;   // c[i] = carry OUT of bit i
+    assign c = g[STAGES] | (p[STAGES] & {WIDTH{cin}});
+
+    assign sum[0] = p[0][0] ^ cin;
+    generate
+        for (i = 1; i < WIDTH; i = i + 1) begin : sumbit
+            assign sum[i] = p[0][i] ^ c[i-1];
+        end
+    endgenerate
+
+    assign cout = c[WIDTH-1];
+
+endmodule
