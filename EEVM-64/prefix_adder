@@ -1,0 +1,45 @@
+// =============================================================================
+// Module   : prefix_adder
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.8
+// Level    : Combinational, parameterized width AND adder style
+//
+// Function : Thin selector between the two parallel-prefix adder styles
+//            locked in Phase 1 (§0): ADDER_TYPE = BRENT_KUNG (default,
+//            primary) or KOGGE_STONE (speed baseline). Both variants are
+//            required to be bit-exact equivalent on sum/cout for every
+//            input — only depth/fan-out (and therefore delay/area) should
+//            differ. That equivalence is exactly what tb_prefix_adder
+//            cross-checks, per the §4 verification hook.
+//
+//            This is the module every vedic_NxN combine stage and the
+//            top-level rv64_multiplier_unit final add will instantiate —
+//            they select ADDER_TYPE once at the top and it propagates
+//            down uniformly.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module prefix_adder #(
+    parameter int WIDTH      = 8,
+    parameter     ADDER_TYPE = "BRENT_KUNG"   // "BRENT_KUNG" or "KOGGE_STONE"
+) (
+    input  logic [WIDTH-1:0] a,
+    input  logic [WIDTH-1:0] b,
+    input  logic             cin,
+    output logic [WIDTH-1:0] sum,
+    output logic             cout
+);
+
+    generate
+        if (ADDER_TYPE == "BRENT_KUNG") begin : g_bk
+            brent_kung_adder #(.WIDTH(WIDTH)) u_adder (
+                .a(a), .b(b), .cin(cin), .sum(sum), .cout(cout)
+            );
+        end else begin : g_ks
+            kogge_stone_adder #(.WIDTH(WIDTH)) u_adder (
+                .a(a), .b(b), .cin(cin), .sum(sum), .cout(cout)
+            );
+        end
+    endgenerate
+
+endmodule
