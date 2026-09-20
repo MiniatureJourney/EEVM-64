@@ -1,0 +1,173 @@
+// =============================================================================
+// Testbench : tb_prefix_adder
+// DUTs      : prefix_adder (ADDER_TYPE=BRENT_KUNG) and
+//             prefix_adder (ADDER_TYPE=KOGGE_STONE), at every width this
+//             design actually uses in the recursive Vedic combine stages
+//             (EEVM-64_architecturePlan.pdf §2.5: width = N/2+2 at each
+//             level -> 4, 6, 10, 18, 34).
+//
+// Method    : At each width, both adder types are driven with the same
+//             stimulus and checked two ways:
+//               1. against a behavioral golden model ((a+b+cin) truncated
+//                  to `width` bits for sum, bit `width` for cout)
+//               2. against EACH OTHER — EEVM-64_architecturePlan.pdf §4
+//                  explicitly requires "prefix_adder: cross-check
+//                  BRENT_KUNG vs KOGGE_STONE produce identical sum/cout
+//                  for the same inputs."
+//
+// Coverage  : WIDTH=4,6      -> exhaustive (all a,b,cin combinations)
+//             WIDTH=10,18,34 -> 4000 randomized vectors each
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_prefix_adder;
+
+    integer total_errors;
+
+    task automatic check_vec(
+        input int          width,
+        input logic [63:0] av,
+        input logic [63:0] bv,
+        input logic         cinv,
+        input logic [63:0] bk_sum,
+        input logic          bk_cout,
+        input logic [63:0] ks_sum,
+        input logic          ks_cout
+    );
+        logic [64:0] golden_full;
+        logic [63:0] golden_sum;
+        logic         golden_cout;
+        begin
+            golden_full = av + bv + cinv;
+            golden_sum  = golden_full & ((64'(1) << width) - 1);
+            golden_cout = golden_full[width];
+
+            if (bk_sum !== golden_sum || bk_cout !== golden_cout) begin
+                total_errors = total_errors + 1;
+                $display("FAIL BK (W=%0d): a=%0d b=%0d cin=%0b -> sum=%0d cout=%0b (expected sum=%0d cout=%0b)",
+                          width, av, bv, cinv, bk_sum, bk_cout, golden_sum, golden_cout);
+            end
+            if (ks_sum !== golden_sum || ks_cout !== golden_cout) begin
+                total_errors = total_errors + 1;
+                $display("FAIL KS (W=%0d): a=%0d b=%0d cin=%0b -> sum=%0d cout=%0b (expected sum=%0d cout=%0b)",
+                          width, av, bv, cinv, ks_sum, ks_cout, golden_sum, golden_cout);
+            end
+            if (bk_sum !== ks_sum || bk_cout !== ks_cout) begin
+                total_errors = total_errors + 1;
+                $display("FAIL CROSS-CHECK (W=%0d): a=%0d b=%0d cin=%0b -> BK(sum=%0d,cout=%0b) != KS(sum=%0d,cout=%0b)",
+                          width, av, bv, cinv, bk_sum, bk_cout, ks_sum, ks_cout);
+            end
+        end
+    endtask
+
+    // ================================================================
+    // WIDTH = 4 — exhaustive
+    // ================================================================
+    localparam int W4 = 4;
+    logic [W4-1:0] a4, b4, bk_sum4, ks_sum4;
+    logic          cin4, bk_cout4, ks_cout4;
+
+    prefix_adder #(.WIDTH(W4), .ADDER_TYPE("BRENT_KUNG")) dut_bk4 (
+        .a(a4), .b(b4), .cin(cin4), .sum(bk_sum4), .cout(bk_cout4));
+    prefix_adder #(.WIDTH(W4), .ADDER_TYPE("KOGGE_STONE")) dut_ks4 (
+        .a(a4), .b(b4), .cin(cin4), .sum(ks_sum4), .cout(ks_cout4));
+
+    // ================================================================
+    // WIDTH = 6 — exhaustive
+    // ================================================================
+    localparam int W6 = 6;
+    logic [W6-1:0] a6, b6, bk_sum6, ks_sum6;
+    logic          cin6, bk_cout6, ks_cout6;
+
+    prefix_adder #(.WIDTH(W6), .ADDER_TYPE("BRENT_KUNG")) dut_bk6 (
+        .a(a6), .b(b6), .cin(cin6), .sum(bk_sum6), .cout(bk_cout6));
+    prefix_adder #(.WIDTH(W6), .ADDER_TYPE("KOGGE_STONE")) dut_ks6 (
+        .a(a6), .b(b6), .cin(cin6), .sum(ks_sum6), .cout(ks_cout6));
+
+    // ================================================================
+    // WIDTH = 10, 18, 34 — randomized
+    // ================================================================
+    localparam int W10 = 10, W18 = 18, W34 = 34;
+
+    logic [W10-1:0] a10, b10, bk_sum10, ks_sum10;
+    logic           cin10, bk_cout10, ks_cout10;
+    prefix_adder #(.WIDTH(W10), .ADDER_TYPE("BRENT_KUNG")) dut_bk10 (
+        .a(a10), .b(b10), .cin(cin10), .sum(bk_sum10), .cout(bk_cout10));
+    prefix_adder #(.WIDTH(W10), .ADDER_TYPE("KOGGE_STONE")) dut_ks10 (
+        .a(a10), .b(b10), .cin(cin10), .sum(ks_sum10), .cout(ks_cout10));
+
+    logic [W18-1:0] a18, b18, bk_sum18, ks_sum18;
+    logic           cin18, bk_cout18, ks_cout18;
+    prefix_adder #(.WIDTH(W18), .ADDER_TYPE("BRENT_KUNG")) dut_bk18 (
+        .a(a18), .b(b18), .cin(cin18), .sum(bk_sum18), .cout(bk_cout18));
+    prefix_adder #(.WIDTH(W18), .ADDER_TYPE("KOGGE_STONE")) dut_ks18 (
+        .a(a18), .b(b18), .cin(cin18), .sum(ks_sum18), .cout(ks_cout18));
+
+    logic [W34-1:0] a34, b34, bk_sum34, ks_sum34;
+    logic           cin34, bk_cout34, ks_cout34;
+    prefix_adder #(.WIDTH(W34), .ADDER_TYPE("BRENT_KUNG")) dut_bk34 (
+        .a(a34), .b(b34), .cin(cin34), .sum(bk_sum34), .cout(bk_cout34));
+    prefix_adder #(.WIDTH(W34), .ADDER_TYPE("KOGGE_STONE")) dut_ks34 (
+        .a(a34), .b(b34), .cin(cin34), .sum(ks_sum34), .cout(ks_cout34));
+
+    integer i, av, bv, cv;
+    logic [31:0] rand_hi, rand_lo;
+
+    initial begin
+        $dumpfile("tb_prefix_adder.vcd");
+        $dumpvars(0, tb_prefix_adder);
+        total_errors = 0;
+
+        // ---- WIDTH=4 exhaustive: 16*16*2 = 512 -------------------------------
+        for (av = 0; av < 16; av = av + 1)
+        for (bv = 0; bv < 16; bv = bv + 1)
+        for (cv = 0; cv < 2; cv = cv + 1) begin
+            a4 = av[3:0]; b4 = bv[3:0]; cin4 = cv[0];
+            #2;
+            check_vec(W4, 64'(av), 64'(bv), cv[0], 64'(bk_sum4), bk_cout4, 64'(ks_sum4), ks_cout4);
+        end
+
+        // ---- WIDTH=6 exhaustive: 64*64*2 = 8192 ------------------------------
+        for (av = 0; av < 64; av = av + 1)
+        for (bv = 0; bv < 64; bv = bv + 1)
+        for (cv = 0; cv < 2; cv = cv + 1) begin
+            a6 = av[5:0]; b6 = bv[5:0]; cin6 = cv[0];
+            #2;
+            check_vec(W6, 64'(av), 64'(bv), cv[0], 64'(bk_sum6), bk_cout6, 64'(ks_sum6), ks_cout6);
+        end
+
+        // ---- WIDTH=10, randomized, 4000 vectors ------------------------------
+        for (i = 0; i < 4000; i = i + 1) begin
+            a10 = $urandom; b10 = $urandom; cin10 = $urandom;
+            #2;
+            check_vec(W10, 64'(a10), 64'(b10), cin10, 64'(bk_sum10), bk_cout10, 64'(ks_sum10), ks_cout10);
+        end
+
+        // ---- WIDTH=18, randomized, 4000 vectors ------------------------------
+        for (i = 0; i < 4000; i = i + 1) begin
+            a18 = $urandom; b18 = $urandom; cin18 = $urandom;
+            #2;
+            check_vec(W18, 64'(a18), 64'(b18), cin18, 64'(bk_sum18), bk_cout18, 64'(ks_sum18), ks_cout18);
+        end
+
+        // ---- WIDTH=34, randomized, 4000 vectors ------------------------------
+        for (i = 0; i < 4000; i = i + 1) begin
+            rand_hi = $urandom; rand_lo = $urandom;
+            a34 = {rand_hi, rand_lo[1:0]};
+            rand_hi = $urandom; rand_lo = $urandom;
+            b34 = {rand_hi, rand_lo[1:0]};
+            cin34 = $urandom;
+            #2;
+            check_vec(W34, 64'(a34), 64'(b34), cin34, 64'(bk_sum34), bk_cout34, 64'(ks_sum34), ks_cout34);
+        end
+
+        #2;
+        if (total_errors == 0)
+            $display("PASS: prefix_adder - BRENT_KUNG and KOGGE_STONE both match golden model AND each other at W=4,6,10,18,34 (512+8192 exhaustive + 12000 randomized vectors).");
+        else
+            $display("FAIL: prefix_adder - %0d mismatches found.", total_errors);
+
+        $finish;
+    end
+
+endmodule
