@@ -1,0 +1,52 @@
+// =============================================================================
+// Testbench : tb_vedic_8x8
+// DUT       : vedic_8x8
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "vedic_8x8: exhaustive if
+//             runtime allows (65,536 combos), otherwise dense random."
+//             65,536 combinations is comfortably exhaustive in simulation.
+//
+// Method    : Exhaustive sweep of all 65,536 (a,b) combinations against
+//             the behavioral golden model (plain unsigned '*').
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_vedic_8x8;
+
+    logic [7:0]  a, b;
+    logic [15:0] p;
+    logic [15:0] expected;
+    integer      errors;
+    integer      i, j;
+
+    vedic_8x8 dut (
+        .a(a), .b(b), .p(p)
+    );
+
+    initial begin
+        $dumpfile("tb_vedic_8x8.vcd");
+        $dumpvars(0, tb_vedic_8x8);
+        errors = 0;
+
+        for (i = 0; i < 256; i = i + 1) begin
+            for (j = 0; j < 256; j = j + 1) begin
+                a = i[7:0];
+                b = j[7:0];
+                #2;
+                expected = i * j;
+                if (p !== expected) begin
+                    errors = errors + 1;
+                    $display("FAIL: a=%0d b=%0d -> p=%0d (expected %0d)", a, b, p, expected);
+                end
+            end
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: vedic_8x8 exhaustive verification - 65536/65536 vectors correct.");
+        else
+            $display("FAIL: vedic_8x8 - %0d/65536 vectors mismatched.", errors);
+
+        $finish;
+    end
+
+endmodule
