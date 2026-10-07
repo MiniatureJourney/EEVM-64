@@ -1,0 +1,25 @@
+// =============================================================================
+// Module   : vedic_4x4
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.5 (module list, §6.1)
+// Level    : Combinational, recursive (first composition level)
+//
+// Function : 4-bit x 4-bit Vedic multiplier. Thin named wrapper around the
+//            generic vedic_multiplier core (see vedic_multiplier.sv for
+//            the recursive construction and the width-correction note —
+//            this level's internal compressor_4to2/prefix_adder run at
+//            widths 6/7, not the architecture doc's stated N/2+2=4).
+// =============================================================================
+`timescale 1ns / 1ps
+
+module vedic_4x4 (
+    input  logic [3:0] a,
+    input  logic [3:0] b,
+    output logic [7:0] p
+);
+
+    vedic_multiplier #(.WIDTH(4)) u_core (
+        .a(a), .b(b), .p(p)
+    );
+
+endmodule
