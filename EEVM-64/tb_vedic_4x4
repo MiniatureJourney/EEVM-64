@@ -1,0 +1,51 @@
+// =============================================================================
+// Testbench : tb_vedic_4x4
+// DUT       : vedic_4x4
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "vedic_4x4: exhaustive
+//             (all input combinations)"
+//
+// Method    : Exhaustive sweep of all 256 (a,b) combinations against the
+//             behavioral golden model (plain unsigned '*').
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_vedic_4x4;
+
+    logic [3:0] a, b;
+    logic [7:0] p;
+    logic [7:0] expected;
+    integer     errors;
+    integer     i, j;
+
+    vedic_4x4 dut (
+        .a(a), .b(b), .p(p)
+    );
+
+    initial begin
+        $dumpfile("tb_vedic_4x4.vcd");
+        $dumpvars(0, tb_vedic_4x4);
+        errors = 0;
+
+        for (i = 0; i < 16; i = i + 1) begin
+            for (j = 0; j < 16; j = j + 1) begin
+                a = i[3:0];
+                b = j[3:0];
+                #2;
+                expected = i * j;
+                if (p !== expected) begin
+                    errors = errors + 1;
+                    $display("FAIL: a=%0d b=%0d -> p=%0d (expected %0d)", a, b, p, expected);
+                end
+            end
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: vedic_4x4 exhaustive verification - 256/256 vectors correct.");
+        else
+            $display("FAIL: vedic_4x4 - %0d/256 vectors mismatched.", errors);
+
+        $finish;
+    end
+
+endmodule
