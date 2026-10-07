@@ -1,0 +1,92 @@
+// =============================================================================
+// Testbench : tb_vedic_16x16
+// DUT       : vedic_16x16
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "vedic_16x16/32x32/64x64:
+//             randomized, weighted toward the boundary-adjacent values
+//             (EEVM-64.pdf §6.2's zero/max/alternating-bit/sparse/dense
+//             cases) plus every 8/16/32/64-bit precision tier." 16-bit is
+//             the first level where exhaustive (2^32 combos) is no longer
+//             feasible in simulation.
+//
+// Method    : (1) every pairing of a curated boundary-value set (zero, max,
+//             alternating-bit, sparse, dense, 8-bit-tier values) against
+//             itself — deterministic and repeatable;
+//             (2) 15,000 fully randomized vectors on top (kept to this
+//             count so the run completes in a bounded time in an
+//             interpreted simulator — vedic_16x16's recursion instantiates
+//             84 gate-level vedic_2x2 cells per multiply).
+//             Both checked against the behavioral golden model.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_vedic_16x16;
+
+    logic [15:0] a, b;
+    logic [31:0] p;
+    logic [31:0] expected;
+    integer      errors;
+    integer      i, j;
+
+    vedic_16x16 dut (
+        .a(a), .b(b), .p(p)
+    );
+
+    // ---- curated boundary-adjacent values (EEVM-64.pdf §6.2) -----------------
+    localparam int NB = 10;
+    logic [15:0] boundary [0:NB-1];
+
+    initial begin
+        boundary[0]  = 16'h0000;   // zero
+        boundary[1]  = 16'hFFFF;   // max unsigned
+        boundary[2]  = 16'h5555;   // alternating bits
+        boundary[3]  = 16'hAAAA;   // alternating bits (inverted)
+        boundary[4]  = 16'h0001;   // sparse (single low bit)
+        boundary[5]  = 16'h8000;   // sparse (single high bit)
+        boundary[6]  = 16'h00FF;   // 8-bit precision-tier boundary
+        boundary[7]  = 16'hFF00;   // 8-bit tier, upper byte
+        boundary[8]  = 16'h7FFF;   // dense, MSB clear
+        boundary[9]  = 16'hFFFE;   // dense, LSB clear
+    end
+
+    initial begin
+        $dumpfile("tb_vedic_16x16.vcd");
+        $dumpvars(0, tb_vedic_16x16);
+        errors = 0;
+        #1; // let the boundary[] initial block settle first
+
+        // ---- boundary x boundary: NB*NB = 100 deterministic vectors ----------
+        for (i = 0; i < NB; i = i + 1) begin
+            for (j = 0; j < NB; j = j + 1) begin
+                a = boundary[i];
+                b = boundary[j];
+                #2;
+                expected = 32'(a) * 32'(b);
+                if (p !== expected) begin
+                    errors = errors + 1;
+                    $display("FAIL (boundary): a=%0h b=%0h -> p=%0h (expected %0h)", a, b, p, expected);
+                end
+            end
+        end
+
+        // ---- 15,000 randomized vectors ----------------------------------------
+        for (i = 0; i < 15000; i = i + 1) begin
+            a = $urandom;
+            b = $urandom;
+            #2;
+            expected = 32'(a) * 32'(b);
+            if (p !== expected) begin
+                errors = errors + 1;
+                $display("FAIL (random): a=%0h b=%0h -> p=%0h (expected %0h)", a, b, p, expected);
+            end
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: vedic_16x16 - 100/100 boundary + 15000/15000 randomized vectors correct.");
+        else
+            $display("FAIL: vedic_16x16 - %0d mismatches found.", errors);
+
+        $finish;
+    end
+
+endmodule
