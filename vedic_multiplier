@@ -1,0 +1,122 @@
+// =============================================================================
+// Module   : vedic_multiplier
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.5 — but see the width
+//            correction note below before trusting that section's numbers.
+// Level    : Combinational, parameterized width, recursive
+//
+// Function : Generic N-bit x N-bit Urdhva-Tiryakbhyam multiplier. WIDTH
+//            must be a power of 2, >= 2. WIDTH=2 bottoms out directly at
+//            vedic_2x2 (the gate-level base case); every larger WIDTH
+//            recursively instantiates itself at WIDTH/2 four times and
+//            combines the four (N/2)x(N/2) sub-products.
+//
+//            This one generic module IS vedic_4x4/8x8/16x16/32x32/64x64 —
+//            each named module in the spec's module list is a one-line
+//            wrapper around vedic_multiplier at a fixed WIDTH (see the
+//            separate vedic_4x4.sv / vedic_8x8.sv / vedic_16x16.sv files).
+//            Recursive self-instantiation was verified to compile and
+//            simulate correctly in Icarus (-g2012) before committing to
+//            this structure over five near-duplicate hand-written files.
+//
+// *** WIDTH CORRECTION vs. EEVM-64_architecturePlan.pdf §2.5 ***
+//   The architecture doc says each level's compressor_4to2 combines at
+//   "the tree's natural width" and its prefix_adder is "width N/2+2".
+//   Worked by hand (and confirmed against a Python model over all five
+//   levels before writing this RTL): N/2+2 cannot be right. For N=4,
+//   P1=aH*bL and P2=aL*bH are each up to 4 bits (max 15); P1+P2 alone can
+//   reach 30, which needs 5 bits, already exceeding a 4-bit adder. No
+//   compressor pre-processing changes this — an M+2-bit adder can't be
+//   the sole resolver of two N-bit cross terms.
+//
+//   The construction actually used here, per (N=2M):
+//     Let P0=aL*bL, P1=aH*bL, P2=aL*bH, P3=aH*bH (each N bits, from four
+//     M-bit recursive sub-multiplies).
+//     compressor_4to2 at WIDTH=3M combines:
+//       w = P0's upper M bits, zero-extended to 3M            (pos 0)
+//       x = P1, zero-extended to 3M                            (pos 0)
+//       y = P2, zero-extended to 3M                            (pos 0)
+//       z = P3 << M, exactly filling the top 2M of the 3M row  (pos M)
+//     giving (sum, carry, cout), each satisfying the compressor identity
+//     w+x+y+z = sum + 2*carry + cout*2^(3M). Because the true sum here
+//     is provably < 2^(3M) (it's exactly floor(result/2^M), and result
+//     fits in 2N=4M bits), cout is mathematically guaranteed to be 0 for
+//     every valid input — verified, not assumed, in the Python model —
+//     but it is still wired through rather than hard-tied, in case that
+//     proof has a gap this construction doesn't yet know about.
+//     A final prefix_adder at WIDTH=3M+1 computes sum + (carry<<1),
+//     which needs the extra bit purely because carry<<1 itself doesn't
+//     fit back in 3M bits (its own MSB), not because of cout.
+//     Result = { that adder's low 3M bits, P0's low M bits }.
+//
+//   This gives prefix_adder widths of 7 / 13 / 25 / 49 / 97 at the
+//   4x4 / 8x8 / 16x16 / 32x32 / 64x64 levels respectively — all
+//   different from the architecture doc's stated 4/6/10/18/34.
+//   compressor_3to2, compressor_4to2 and prefix_adder needed ZERO RTL
+//   changes for this — they were already fully width-generic; only the
+//   widths they get instantiated at, here, are different from what the
+//   spec originally assumed.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module vedic_multiplier #(
+    parameter int WIDTH = 4
+) (
+    input  logic [WIDTH-1:0]   a,
+    input  logic [WIDTH-1:0]   b,
+    output logic [2*WIDTH-1:0] p
+);
+
+    generate
+        if (WIDTH == 2) begin : g_base
+            vedic_2x2 u_base (.a(a), .b(b), .p(p));
+        end else begin : g_recurse
+            localparam int M = WIDTH / 2;
+
+            logic [M-1:0] aH, aL, bH, bL;
+            assign aH = a[WIDTH-1:M];
+            assign aL = a[M-1:0];
+            assign bH = b[WIDTH-1:M];
+            assign bL = b[M-1:0];
+
+            // four (WIDTH/2)x(WIDTH/2) recursive sub-products, each WIDTH bits
+            logic [WIDTH-1:0] P0, P1, P2, P3;
+
+            vedic_multiplier #(.WIDTH(M)) u_p0 (.a(aL), .b(bL), .p(P0)); // aL*bL
+            vedic_multiplier #(.WIDTH(M)) u_p1 (.a(aH), .b(bL), .p(P1)); // aH*bL
+            vedic_multiplier #(.WIDTH(M)) u_p2 (.a(aL), .b(bH), .p(P2)); // aL*bH
+            vedic_multiplier #(.WIDTH(M)) u_p3 (.a(aH), .b(bH), .p(P3)); // aH*bH
+
+            // ---- single compressor_4to2 stage, width 3M (see header note) ----
+            localparam int CW = 3 * M;
+            logic [CW-1:0] c_w, c_x, c_y, c_z, c_sum, c_carry;
+            logic           c_cout;
+
+            assign c_w = {{(2*M){1'b0}}, P0[WIDTH-1:M]};  // P0 upper half
+            assign c_x = {{M{1'b0}}, P1};                  // P1, full
+            assign c_y = {{M{1'b0}}, P2};                  // P2, full
+            assign c_z = {P3, {M{1'b0}}};                  // P3 << M
+
+            compressor_4to2 #(.WIDTH(CW)) u_compress (
+                .w(c_w), .x(c_x), .y(c_y), .z(c_z), .cin(1'b0),
+                .sum(c_sum), .carry(c_carry), .cout(c_cout)
+            );
+
+            // ---- single prefix_adder stage, width 3M+1 ------------------------
+            localparam int AW = CW + 1;
+            logic [AW-1:0] add_a, add_b, add_sum;
+            logic          add_cout;
+
+            assign add_a = {1'b0, c_sum};
+            assign add_b = {c_carry, 1'b0};   // carry << 1
+
+            prefix_adder #(.WIDTH(AW)) u_final_add (
+                .a(add_a), .b(add_b), .cin(c_cout), .sum(add_sum), .cout(add_cout)
+            );
+
+            // ---- result assembly: {resolved upper 3M bits, untouched lower M} -
+            assign p = {add_sum[CW-1:0], P0[M-1:0]};
+        end
+    endgenerate
+
+endmodule
