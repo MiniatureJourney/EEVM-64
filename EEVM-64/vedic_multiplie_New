@@ -1,0 +1,133 @@
+// =============================================================================
+// Module   : vedic_multiplier
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.5 (with the corrections below)
+// Level    : Combinational, parameterized width, recursive
+//
+// Function : Generic N-bit x N-bit unsigned Urdhva-Tiryakbhyam multiplier.
+//            WIDTH must be a power of 2, >= 2. WIDTH=2 is vedic_2x2 (the
+//            gate-level base case); every larger WIDTH instantiates itself
+//            four times at WIDTH/2 and combines the four sub-products.
+//            vedic_4x4 / 8x8 / 16x16 / 32x32 / 64x64 are one-line wrappers
+//            around this module.
+//
+// Parameters
+//   WIDTH      operand width (power of 2, >= 2)
+//   ADDER_TYPE "BRENT_KUNG" (default) | "KOGGE_STONE" — final adder at every
+//              level, passed straight through to prefix_adder.
+//   COMBINE    "CSA_3TO2" (default) | "COMP_4TO2" — how the overlapping
+//              sub-product rows are reduced before the adder (see below).
+//
+// Combine stage, per level (N = 2M)
+//   Let P0=aL*bL, P1=aH*bL, P2=aL*bH, P3=aH*bH (each N bits). The product is
+//       P0 + (P1 + P2)<<M + P3<<2M
+//   Looking at which result columns each sub-product occupies:
+//       cols [0 , M)   : P0 low half                  -> final, untouched
+//       cols [M , 2M)  : P0 high, P1 low, P2 low      (3 rows)
+//       cols [2M, 3M)  : P1 high, P2 high, P3 low     (3 rows)
+//       cols [3M, 4M)  : P3 high                      (1 row)
+//   so AT MOST THREE rows are ever live in one column.
+//
+//   COMBINE = "CSA_3TO2" (default):
+//       row A = {P3[M-1:0], P0[N-1:M]}   (P0-high and P3-low never share a
+//                                         column, so they pack into ONE row)
+//       row B = P1, row C = P2           -> one compressor_3to2 of width 2M.
+//       A final prefix_adder of width 3M adds (sum) + (carry << 1) with P3's
+//       high half carried in the top M bits.
+//   COMBINE = "COMP_4TO2":
+//       the same four operands go through compressor_4to2 at width 3M
+//       (w = P0 high, x = P1, y = P2, z = P3 << M). With at most three live
+//       rows per column the 4th input is never used, so this is a full adder
+//       plus a half adder per column — about 8% more LUTs at 32x32 in a
+//       Yosys mapping — and is kept so the compressor choice can be
+//       reported as an ablation, and to exercise compressor_4to2 in the
+//       actual datapath. Both settings are bit-exact.
+//
+// Corrections vs EEVM-64_architecturePlan.pdf §2.5 (all verified, see
+// docs/phase2_design_decisions.md):
+//   * The spec's "prefix_adder width N/2+2" cannot hold: P1+P2 alone needs
+//     N+1 bits. The adder here is 3M = 3N/2 bits wide: 6/12/24/48/96 for the
+//     4x4/8x8/16x16/32x32/64x64 levels.
+//   * Adder width is 3M, not 3M+1: the true value of the three-row sum is
+//     floor(product / 2^M) < 2^(3M), and sum + 2*carry (+ 2^(3M)*cout) must
+//     equal it, so the compressor's cout and the MSB of its carry vector are
+//     provably 0. The adder therefore needs no extra bit and no carry-in, and
+//     the compressor cout is left unconnected.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module vedic_multiplier #(
+    parameter int WIDTH      = 4,
+    parameter     ADDER_TYPE = "BRENT_KUNG",   // "BRENT_KUNG" | "KOGGE_STONE"
+    parameter     COMBINE    = "CSA_3TO2"      // "CSA_3TO2"   | "COMP_4TO2"
+) (
+    input  logic [WIDTH-1:0]   a,
+    input  logic [WIDTH-1:0]   b,
+    output logic [2*WIDTH-1:0] p
+);
+
+    generate
+        if (WIDTH == 2) begin : g_base
+            vedic_2x2 u_base (.a(a), .b(b), .p(p));
+        end else begin : g_recurse
+            localparam int M  = WIDTH / 2;
+            localparam int CW = 3 * M;          // adder width / result upper part
+
+            logic [M-1:0] aH, aL, bH, bL;
+            assign aH = a[WIDTH-1:M];
+            assign aL = a[M-1:0];
+            assign bH = b[WIDTH-1:M];
+            assign bL = b[M-1:0];
+
+            // four (WIDTH/2)x(WIDTH/2) recursive sub-products, each WIDTH bits
+            logic [WIDTH-1:0] P0, P1, P2, P3;
+            vedic_multiplier #(.WIDTH(M), .ADDER_TYPE(ADDER_TYPE), .COMBINE(COMBINE))
+                u_p0 (.a(aL), .b(bL), .p(P0));   // aL*bL
+            vedic_multiplier #(.WIDTH(M), .ADDER_TYPE(ADDER_TYPE), .COMBINE(COMBINE))
+                u_p1 (.a(aH), .b(bL), .p(P1));   // aH*bL
+            vedic_multiplier #(.WIDTH(M), .ADDER_TYPE(ADDER_TYPE), .COMBINE(COMBINE))
+                u_p2 (.a(aL), .b(bH), .p(P2));   // aL*bH
+            vedic_multiplier #(.WIDTH(M), .ADDER_TYPE(ADDER_TYPE), .COMBINE(COMBINE))
+                u_p3 (.a(aH), .b(bH), .p(P3));   // aH*bH
+
+            // adder operands (carry-save pair, already aligned to column 0 of
+            // the upper 3M bits of the result)
+            logic [CW-1:0] add_a, add_b, add_sum;
+
+            if (COMBINE == "COMP_4TO2") begin : g_c42
+                logic [CW-1:0] c_w, c_x, c_y, c_z, c_sum, c_carry;
+                assign c_w = {{(2*M){1'b0}}, P0[WIDTH-1:M]};   // P0 high half
+                assign c_x = {{M{1'b0}}, P1};                   // P1
+                assign c_y = {{M{1'b0}}, P2};                   // P2
+                assign c_z = {P3, {M{1'b0}}};                   // P3 << M
+
+                compressor_4to2 #(.WIDTH(CW)) u_compress (
+                    .w(c_w), .x(c_x), .y(c_y), .z(c_z), .cin(1'b0),
+                    .sum(c_sum), .carry(c_carry), .cout()       // cout provably 0
+                );
+
+                assign add_a = c_sum;
+                assign add_b = {c_carry[CW-2:0], 1'b0};         // carry<<1 (MSB provably 0)
+            end else begin : g_csa
+                logic [2*M-1:0] row_a, csa_sum, csa_carry;
+                assign row_a = {P3[M-1:0], P0[WIDTH-1:M]};
+
+                compressor_3to2 #(.WIDTH(2*M)) u_csa (
+                    .x(row_a), .y(P1), .z(P2),
+                    .sum(csa_sum), .carry(csa_carry)
+                );
+
+                assign add_a = {P3[WIDTH-1:M], csa_sum};        // P3 high rides on top
+                assign add_b = {{(M-1){1'b0}}, csa_carry, 1'b0};// carry<<1
+            end
+
+            prefix_adder #(.WIDTH(CW), .ADDER_TYPE(ADDER_TYPE)) u_final_add (
+                .a(add_a), .b(add_b), .cin(1'b0), .sum(add_sum), .cout()
+            );
+
+            // {resolved upper 3M bits, untouched lower M bits}
+            assign p = {add_sum, P0[M-1:0]};
+        end
+    endgenerate
+
+endmodule
