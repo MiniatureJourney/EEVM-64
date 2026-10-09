@@ -1,0 +1,127 @@
+// =============================================================================
+// Testbench : tb_compressor_4to2
+// DUT       : compressor_4to2
+//
+// Method    : Rather than re-implementing the per-bit chain in the
+//             testbench (which would just duplicate the DUT's own logic),
+//             this checks the fundamental value-preserving identity every
+//             correct 4:2 compressor must satisfy:
+//
+//                 w_int + x_int + y_int + z_int + cin
+//                     == sum_int + 2*carry_int + (2^WIDTH)*cout
+//
+//             i.e. the five inputs and the three outputs represent the same
+//             total quantity, just redistributed across sum/carry/cout with
+//             carry pre-shifted and cout weighted one bit beyond the top of
+//             the vector. This is exactly the property downstream stages
+//             (prefix_adder) rely on.
+//
+//             STRUCTURAL CHECK (added with the Phase 2 wiring fix): in a
+//             standard 4:2 compressor the horizontal output `cout` is a
+//             function of w,x,y,z ONLY — it must not change when `cin`
+//             toggles. If it did, the cin->cout path would exist in every
+//             column and carries would ripple across the whole width. The
+//             first release failed this property (it was value-correct but
+//             rippled); this testbench now catches that.
+//
+// Coverage  : WIDTH=2, exhaustive (all 512 (w,x,y,z,cin) combinations),
+//             each also re-evaluated with cin flipped (cout must not move).
+//             WIDTH=8, 2000 randomized vectors, same flip check.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_compressor_4to2;
+
+    // ---- Instance A: WIDTH=2, exhaustive -------------------------------------
+    localparam int WA = 2;
+    logic [WA-1:0] wA, xA, yA, zA, sumA, carryA;
+    logic          cinA, coutA;
+
+    compressor_4to2 #(.WIDTH(WA)) dutA (
+        .w(wA), .x(xA), .y(yA), .z(zA), .cin(cinA),
+        .sum(sumA), .carry(carryA), .cout(coutA)
+    );
+
+    // ---- Instance B: WIDTH=8, randomized -------------------------------------
+    localparam int WB = 8;
+    logic [WB-1:0] wB, xB, yB, zB, sumB, carryB;
+    logic          cinB, coutB;
+
+    compressor_4to2 #(.WIDTH(WB)) dutB (
+        .w(wB), .x(xB), .y(yB), .z(zB), .cin(cinB),
+        .sum(sumB), .carry(carryB), .cout(coutB)
+    );
+
+    integer errors;
+    integer i, wv, xv, yv, zv, cv;
+    longint lhs, rhs;
+    logic   cout_ref;
+
+    initial begin
+        $dumpfile("tb_compressor_4to2.vcd");
+        $dumpvars(0, tb_compressor_4to2);
+        errors = 0;
+
+        // ---- exhaustive WIDTH=2 sweep: 4*4*4*4*2 = 512 combinations ----------
+        for (wv = 0; wv < 4; wv = wv + 1)
+        for (xv = 0; xv < 4; xv = xv + 1)
+        for (yv = 0; yv < 4; yv = yv + 1)
+        for (zv = 0; zv < 4; zv = zv + 1)
+        for (cv = 0; cv < 2; cv = cv + 1) begin
+            wA = wv[1:0]; xA = xv[1:0]; yA = yv[1:0]; zA = zv[1:0]; cinA = cv[0];
+            #2;
+            lhs = wv + xv + yv + zv + cv;
+            rhs = sumA + 2*carryA + (1 << WA) * coutA;
+            if (lhs !== rhs) begin
+                errors = errors + 1;
+                $display("FAIL (W=2): w=%0d x=%0d y=%0d z=%0d cin=%0d -> sum=%0d carry=%0d cout=%0d (lhs=%0d rhs=%0d)",
+                          wv, xv, yv, zv, cv, sumA, carryA, coutA, lhs, rhs);
+            end
+
+            // structural: cout must not depend on cin (no ripple across columns)
+            cout_ref = coutA;
+            cinA = ~cinA;
+            #2;
+            if (coutA !== cout_ref) begin
+                errors = errors + 1;
+                $display("FAIL (W=2, no-ripple): w=%0d x=%0d y=%0d z=%0d: cout changed when cin toggled", wv, xv, yv, zv);
+            end
+            lhs = wv + xv + yv + zv + (1 - cv);
+            rhs = sumA + 2*carryA + (1 << WA) * coutA;
+            if (lhs !== rhs) begin
+                errors = errors + 1;
+                $display("FAIL (W=2, cin flipped): w=%0d x=%0d y=%0d z=%0d cin=%0d (lhs=%0d rhs=%0d)", wv, xv, yv, zv, 1 - cv, lhs, rhs);
+            end
+        end
+
+        // ---- randomized WIDTH=8 sweep -----------------------------------------
+        for (i = 0; i < 2000; i = i + 1) begin
+            wB = $urandom; xB = $urandom; yB = $urandom; zB = $urandom; cinB = $urandom;
+            #2;
+            lhs = wB + xB + yB + zB + cinB;
+            rhs = sumB + 2*carryB + (longint'(1) << WB) * coutB;
+            if (lhs !== rhs) begin
+                errors = errors + 1;
+                $display("FAIL (W=8): w=%0h x=%0h y=%0h z=%0h cin=%0b -> sum=%0h carry=%0h cout=%0b (lhs=%0d rhs=%0d)",
+                          wB, xB, yB, zB, cinB, sumB, carryB, coutB, lhs, rhs);
+            end
+
+            cout_ref = coutB;
+            cinB = ~cinB;
+            #2;
+            if (coutB !== cout_ref) begin
+                errors = errors + 1;
+                $display("FAIL (W=8, no-ripple): w=%0h x=%0h y=%0h z=%0h: cout changed when cin toggled", wB, xB, yB, zB);
+            end
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: compressor_4to2 - 512/512 exhaustive (W=2) + 2000/2000 randomized (W=8) vectors satisfy the value identity AND cout is independent of cin (no ripple), also with cin flipped.");
+        else
+            $display("FAIL: compressor_4to2 - %0d mismatches found.", errors);
+
+        $finish;
+    end
+
+endmodule
