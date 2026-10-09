@@ -1,0 +1,69 @@
+// =============================================================================
+// Testbench : tb_vedic_8x8
+// DUTs      : vedic_8x8 (3 configurations, see below)
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "vedic_8x8: exhaustive"
+//
+// Method    : Exhaustive sweep of all 65,536 (a,b) combinations. Three DUT
+//             configurations are driven in parallel and every output is checked
+//             against the behavioral golden model (plain unsigned '*'):
+//               dut_bk  : ADDER_TYPE=BRENT_KUNG, COMBINE=CSA_3TO2  (proposed default)
+//               dut_ks  : ADDER_TYPE=KOGGE_STONE, COMBINE=CSA_3TO2
+//               dut_c42 : ADDER_TYPE=BRENT_KUNG, COMBINE=COMP_4TO2
+//
+// Pass/fail : prints one PASS/FAIL summary line; paste it into the
+//             testingDataBlockwise doc for this block.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_vedic_8x8;
+
+    logic [7:0]  a, b;
+    logic [15:0] p_bk, p_ks, p_c42;
+    logic [15:0] expected;
+    integer      errors;
+    integer      i, j;
+
+    vedic_8x8 #(.ADDER_TYPE("BRENT_KUNG"),  .COMBINE("CSA_3TO2")) dut_bk  (.a(a), .b(b), .p(p_bk));
+    vedic_8x8 #(.ADDER_TYPE("KOGGE_STONE"), .COMBINE("CSA_3TO2")) dut_ks  (.a(a), .b(b), .p(p_ks));
+    vedic_8x8 #(.ADDER_TYPE("BRENT_KUNG"),  .COMBINE("COMP_4TO2")) dut_c42 (.a(a), .b(b), .p(p_c42));
+
+    // ---- one vector: drive, settle, compare all three configs -------------
+    task automatic apply_and_check(input logic [7:0] av, input logic [7:0] bv, input string tag);
+        begin
+            a = av;
+            b = bv;
+            #2;
+            expected = 16'(av) * 16'(bv);
+            if (p_bk !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] BRENT_KUNG/CSA_3TO2 : a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_bk, expected);
+            end
+            if (p_ks !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] KOGGE_STONE/CSA_3TO2: a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_ks, expected);
+            end
+            if (p_c42 !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] BRENT_KUNG/COMP_4TO2: a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_c42, expected);
+            end
+        end
+    endtask
+
+    initial begin
+        $dumpfile("tb_vedic_8x8.vcd");
+        $dumpvars(0, tb_vedic_8x8);
+        errors = 0;
+
+        for (i = 0; i < 256; i = i + 1)
+            for (j = 0; j < 256; j = j + 1)
+                apply_and_check(i[7:0], j[7:0], "exhaustive");
+
+        #2;
+        if (errors == 0)
+            $display("PASS: vedic_8x8 exhaustive verification - 65536/65536 vectors correct on all 3 configurations (BK/CSA_3TO2, KS/CSA_3TO2, BK/COMP_4TO2).");
+        else
+            $display("FAIL: vedic_8x8 - %0d mismatches found.", errors);
+        $finish;
+    end
+
+endmodule
