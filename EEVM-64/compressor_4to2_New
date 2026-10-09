@@ -1,0 +1,96 @@
+// =============================================================================
+// Module   : compressor_4to2
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.7
+// Level    : Combinational, parameterized width
+//
+// Function : Standard 4:2 compressor, built as WIDTH per-bit cells, each
+//            cell itself two cascaded compressor_3to2 (WIDTH=1) instances —
+//            literally "two cascaded compressor_3to2 stages" as specced,
+//            replicated across the width via generate.
+//
+//   Per bit i (standard 4:2 wiring; REVISED in Phase 2 block 8/9 pass):
+//     FA1 = compressor_3to2(w[i], x[i], y[i])         -> (s1, c1)
+//     FA2 = compressor_3to2(s1,   z[i], chain[i])      -> (sum[i], c2)
+//     chain[i+1] = c1      (horizontal bit to the next column; a function of
+//                           w,x,y ONLY, so it never depends on cin and no
+//                           carry ripples across columns)
+//     carry[i]   = c2      (vertical output, weight 2x)
+//   The first release wired these two carries the other way round
+//   (chain[i+1] = c2, carry[i] = c1). That was still value-correct, but it
+//   made chain[i+1] depend on chain[i], i.e. a ripple chain across the
+//   whole width - exactly what a 4:2 compressor exists to avoid.
+//
+//   chain[0]     = cin   (module input)
+//   chain[WIDTH] = cout  (module output)
+//
+// Design note — spec ambiguity flagged and resolved here:
+//   EEVM-64_architecturePlan.pdf's port table lists "cin" grouped with
+//   w,x,y,z under width "W", but separately calls out "cout" as exactly
+//   1 bit. Read literally that's inconsistent with "standard 4:2 compressor
+//   construction" (the term of art always means a per-bit cell with a
+//   1-bit horizontal Cin/Cout chain between adjacent bit positions — this
+//   is what lets 4:2 compressors avoid full-width ripple-carry chains in a
+//   Wallace/Dadda-style reduction tree). The likely explanation: "cout"
+//   visibly got mangled across a line break in the PDF extraction ("cou" /
+//   "t"), which is good evidence the whole ports table suffered formatting
+//   loss, and "cin" losing its own "width 1" annotation is the same class
+//   of extraction error. This module therefore implements cin/cout as
+//   single bits per the named "standard 4:2 compressor" construction, not
+//   as width-W vectors. This has been verified against the integer
+//   identity every 4:2 compressor must satisfy (see testbench):
+//
+//       w_int + x_int + y_int + z_int + cin == sum_int + 2*carry_int + 2^WIDTH*cout
+//
+//   Flagging this now, before it's replicated into all five vedic_NxN
+//   combine stages above it — please confirm or correct before Block 5.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module compressor_4to2 #(
+    parameter int WIDTH = 8
+) (
+    input  logic [WIDTH-1:0] w,
+    input  logic [WIDTH-1:0] x,
+    input  logic [WIDTH-1:0] y,
+    input  logic [WIDTH-1:0] z,
+    input  logic             cin,
+    output logic [WIDTH-1:0] sum,
+    output logic [WIDTH-1:0] carry,
+    output logic             cout
+);
+
+    // chain[0] = cin (module input), chain[WIDTH] = cout (module output),
+    // chain[i] for 0 < i < WIDTH is the internal bit-to-bit ripple.
+    logic [WIDTH:0] chain;
+    assign chain[0] = cin;
+    assign cout     = chain[WIDTH];
+
+    genvar i;
+    generate
+        for (i = 0; i < WIDTH; i = i + 1) begin : bitslice
+            logic s1_bit, c1_bit;
+
+            // FA1: reduces w,x,y at this bit position (no chain involved)
+            compressor_3to2 #(.WIDTH(1)) fa1 (
+                .x(w[i]), .y(x[i]), .z(y[i]),
+                .sum(s1_bit), .carry(c1_bit)
+            );
+
+            // FA2: folds in z and the incoming horizontal chain bit
+            logic c2_bit;
+            compressor_3to2 #(.WIDTH(1)) fa2 (
+                .x(s1_bit), .y(z[i]), .z(chain[i]),
+                .sum(sum[i]), .carry(c2_bit)
+            );
+
+            // Standard 4:2 wiring: the horizontal bit handed to the next
+            // column is FA1's carry (a function of w,x,y ONLY - independent
+            // of cin), so no carry ripples across columns. FA2's carry is
+            // the vertical 'carry' output.
+            assign chain[i+1] = c1_bit;
+            assign carry[i]   = c2_bit;
+        end
+    endgenerate
+
+endmodule
