@@ -1,0 +1,129 @@
+// =============================================================================
+// Testbench : tb_vedic_64x64
+// DUTs      : vedic_64x64 (3 configurations, see below)
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "randomized, weighted toward boundary-adjacent
+//             values plus every 8/16/32/64-bit precision tier"
+//
+// Method    : (1) every pairing of a curated boundary-value set (zero, max,
+//             alternating-bit, sparse, dense, byte/half/word-tier values);
+//             (2) walking-one operand against all-ones, both ways (128 vectors);
+//             (3) NRAND randomized vectors, mixed density (plain / OR-dense /
+//             AND-sparse / single-zero) to stress carry chains.
+//             Three DUT configurations run in parallel, all checked against
+//             the behavioral golden model (plain unsigned '*'):
+//               dut_bk  : ADDER_TYPE=BRENT_KUNG, COMBINE=CSA_3TO2  (proposed default)
+//               dut_ks  : ADDER_TYPE=KOGGE_STONE, COMBINE=CSA_3TO2
+//               dut_c42 : ADDER_TYPE=BRENT_KUNG, COMBINE=COMP_4TO2
+//
+// Pass/fail : prints one PASS/FAIL summary line; paste it into the
+//             testingDataBlockwise doc for this block.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_vedic_64x64 #(
+    parameter int NRAND = 500
+);
+
+    logic [63:0]  a, b;
+    logic [127:0] p_bk, p_ks, p_c42;
+    logic [127:0] expected;
+    integer      errors;
+    integer      i, j;
+
+    vedic_64x64 #(.ADDER_TYPE("BRENT_KUNG"),  .COMBINE("CSA_3TO2")) dut_bk  (.a(a), .b(b), .p(p_bk));
+    vedic_64x64 #(.ADDER_TYPE("KOGGE_STONE"), .COMBINE("CSA_3TO2")) dut_ks  (.a(a), .b(b), .p(p_ks));
+    vedic_64x64 #(.ADDER_TYPE("BRENT_KUNG"),  .COMBINE("COMP_4TO2")) dut_c42 (.a(a), .b(b), .p(p_c42));
+
+    // ---- one vector: drive, settle, compare all three configs -------------
+    task automatic apply_and_check(input logic [63:0] av, input logic [63:0] bv, input string tag);
+        begin
+            a = av;
+            b = bv;
+            #2;
+            expected = 128'(av) * 128'(bv);
+            if (p_bk !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] BRENT_KUNG/CSA_3TO2 : a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_bk, expected);
+            end
+            if (p_ks !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] KOGGE_STONE/CSA_3TO2: a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_ks, expected);
+            end
+            if (p_c42 !== expected) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] BRENT_KUNG/COMP_4TO2: a=%0h b=%0h -> p=%0h (expected %0h)", tag, av, bv, p_c42, expected);
+            end
+        end
+    endtask
+
+    // ---- curated boundary-adjacent values (EEVM-64.pdf §6.2) ---------------
+    localparam int NB = 14;
+    logic [63:0] boundary [0:NB-1];
+    initial begin
+        boundary[0] = 64'h0000000000000000;   // zero
+        boundary[1] = 64'hFFFFFFFFFFFFFFFF;   // max unsigned
+        boundary[2] = 64'h5555555555555555;   // alternating 01
+        boundary[3] = 64'hAAAAAAAAAAAAAAAA;   // alternating 10
+        boundary[4] = 64'h0000000000000001;   // sparse: LSB only
+        boundary[5] = 64'h8000000000000000;   // sparse: MSB only
+        boundary[6] = 64'h00000000000000FF;   // 8-bit tier: low byte
+        boundary[7] = 64'hFF00000000000000;   // 8-bit tier: top byte
+        boundary[8] = 64'h00000000FFFFFFFF;   // low half ones
+        boundary[9] = 64'hFFFFFFFF00000000;   // high half ones
+        boundary[10] = 64'h7FFFFFFFFFFFFFFF;   // dense, MSB clear
+        boundary[11] = 64'hFFFFFFFFFFFFFFFE;   // dense, LSB clear
+        boundary[12] = 64'h000000000000FFFF;   // 16-bit tier: low half-word
+        boundary[13] = 64'h0000000100000001;   // bit N/2 and bit 0
+    end
+
+    // ---- random operand generator with density modes -----------------------
+    function automatic logic [63:0] rnd();
+        logic [63:0] r;
+        begin
+            r = {$urandom, $urandom};
+            rnd = r;
+        end
+    endfunction
+
+    integer k;
+    logic [63:0] ra, rb;
+
+    initial begin
+        $dumpfile("tb_vedic_64x64.vcd");
+        $dumpvars(0, tb_vedic_64x64);
+        errors = 0;
+        #1; // let boundary[] settle
+
+        // (1) boundary x boundary
+        for (i = 0; i < NB; i = i + 1)
+            for (j = 0; j < NB; j = j + 1)
+                apply_and_check(boundary[i], boundary[j], "boundary");
+
+        // (2) walking one against all-ones, both ways
+        for (i = 0; i < 64; i = i + 1) begin
+            apply_and_check(64'(1) << i, 64'hFFFFFFFFFFFFFFFF, "walk-a");
+            apply_and_check(64'hFFFFFFFFFFFFFFFF, 64'(1) << i, "walk-b");
+        end
+
+        // (3) mixed-density randomized
+        for (k = 0; k < NRAND; k = k + 1) begin
+            ra = rnd();
+            rb = rnd();
+            case (k % 4)
+                1: begin ra = ra | rnd(); rb = rb | rnd(); end      // OR-dense
+                2: begin ra = ra & rnd(); rb = rb & rnd(); end      // AND-sparse
+                3: begin ra = ~(64'(1) << ($urandom % 64)); rb = rb | rnd(); end // single zero
+                default: ;
+            endcase
+            apply_and_check(ra, rb, "random");
+        end
+
+        #2;
+        if (errors == 0)
+            $display("PASS: vedic_64x64 - %0d boundary + 128 walking-one + %0d randomized vectors correct on all 3 configurations (BK/CSA_3TO2, KS/CSA_3TO2, BK/COMP_4TO2).", NB*NB, NRAND);
+        else
+            $display("FAIL: vedic_64x64 - %0d mismatches found.", errors);
+        $finish;
+    end
+
+endmodule
