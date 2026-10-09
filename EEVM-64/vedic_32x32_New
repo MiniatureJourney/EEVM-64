@@ -1,0 +1,35 @@
+// =============================================================================
+// Module   : vedic_32x32
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.5 (module list, §6.1)
+// Level    : Combinational, recursive
+//
+// Function : 32-bit x 32-bit unsigned Vedic multiplier. Thin named wrapper
+//            around the generic vedic_multiplier core — see
+//            vedic_multiplier.sv for the construction and the corrections to
+//            the architecture doc. This level's final prefix_adder is 48 bits
+//            wide (compressor: 32-bit 3:2, or 48-bit 4:2 when
+//            COMBINE = "COMP_4TO2").
+//
+// Parameters (defaults give the proposed design):
+//   ADDER_TYPE : "BRENT_KUNG" | "KOGGE_STONE"
+//   COMBINE    : "CSA_3TO2"   | "COMP_4TO2"
+// =============================================================================
+`timescale 1ns / 1ps
+
+module vedic_32x32 #(
+    parameter ADDER_TYPE = "BRENT_KUNG",
+    parameter COMBINE    = "CSA_3TO2"
+) (
+    input  logic [31:0] a,
+    input  logic [31:0] b,
+    output logic [63:0] p
+);
+
+    vedic_multiplier #(
+        .WIDTH(32), .ADDER_TYPE(ADDER_TYPE), .COMBINE(COMBINE)
+    ) u_core (
+        .a(a), .b(b), .p(p)
+    );
+
+endmodule
