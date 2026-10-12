@@ -1,0 +1,113 @@
+// =============================================================================
+// Testbench : tb_operand_isolation
+// DUT       : operand_isolation
+// Spec ref  : EEVM-64_architecturePlan.pdf §4 — "operand_isolation: confirm
+//             forced-zero bits exactly at/above the detected boundary,
+//             pass-through exactly below it."
+//
+// Method    : For each of the four levels the number of kept low bits is
+//               level 00 -> 8, 01 -> 16, 10 -> 32, 11 -> 64.
+//             The expected outputs are built bit by bit with a loop:
+//               out[i] = (i < kept) ? in[i] : 0
+//             and both outputs are compared in full on every vector. Stimulus per
+//             level: all-ones (output must equal the keep mask EXACTLY, so any bit
+//             forced or passed one position off is caught), all-zeros, alternating
+//             patterns, walking-one / walking-zero on a and on b (separately, so a
+//             dependence of a_iso on b would show), and RANDOM random pairs.
+//
+// Pass/fail : prints one PASS/FAIL summary line for testingDataBlockwise.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_operand_isolation #(
+    parameter int RANDOM = 20000      // random pairs per level
+);
+
+    logic [63:0] a, b;
+    logic [1:0]  level;
+    logic [63:0] a_iso, b_iso;
+
+    operand_isolation dut (.a(a), .b(b), .level(level), .a_iso(a_iso), .b_iso(b_iso));
+
+    integer errors, n_vec;
+
+    function automatic int kept_bits(input logic [1:0] l);
+        begin
+            case (l)
+                2'd0:    kept_bits = 8;
+                2'd1:    kept_bits = 16;
+                2'd2:    kept_bits = 32;
+                default: kept_bits = 64;
+            endcase
+        end
+    endfunction
+
+    function automatic logic [63:0] ref_iso(input logic [63:0] x, input logic [1:0] l);
+        logic [63:0] y;
+        begin
+            y = 64'd0;
+            for (int i = 0; i < 64; i++) y[i] = (i < kept_bits(l)) ? x[i] : 1'b0;
+            ref_iso = y;
+        end
+    endfunction
+
+    task automatic check(input logic [63:0] av, input logic [63:0] bv, input logic [1:0] lv, input string tag);
+        begin
+            a = av; b = bv; level = lv;
+            #1;
+            n_vec = n_vec + 1;
+            if (a_iso !== ref_iso(av, lv)) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] a_iso level=%0d a=%h b=%h -> %h (expected %h)", tag, lv, av, bv, a_iso, ref_iso(av, lv));
+            end
+            if (b_iso !== ref_iso(bv, lv)) begin
+                errors = errors + 1;
+                if (errors <= 10) $display("FAIL [%s] b_iso level=%0d a=%h b=%h -> %h (expected %h)", tag, lv, av, bv, b_iso, ref_iso(bv, lv));
+            end
+        end
+    endtask
+
+    integer lv, i, k;
+    logic [63:0] ones, ra, rb;
+
+    initial begin
+        $dumpfile("tb_operand_isolation.vcd");
+        $dumpvars(0, tb_operand_isolation);
+        errors = 0;
+        n_vec  = 0;
+        ones   = '1;
+
+        for (lv = 0; lv < 4; lv = lv + 1) begin
+            // exact-boundary checks
+            check(ones, ones, lv[1:0], "all-ones");
+            check(ones, 64'd0, lv[1:0], "ones/zero");
+            check(64'd0, ones, lv[1:0], "zero/ones");
+            check(64'd0, 64'd0, lv[1:0], "zeros");
+            check(64'h5555555555555555, 64'hAAAAAAAAAAAAAAAA, lv[1:0], "alt");
+            check(64'hAAAAAAAAAAAAAAAA, 64'h5555555555555555, lv[1:0], "alt-inv");
+
+            // walking one / walking zero on a (b fixed) and on b (a fixed)
+            for (i = 0; i < 64; i = i + 1) begin
+                check(64'd1 << i,  ones,        lv[1:0], "walk1-a");
+                check(~(64'd1 << i), 64'd0,     lv[1:0], "walk0-a");
+                check(ones,        64'd1 << i,  lv[1:0], "walk1-b");
+                check(64'd0,       ~(64'd1 << i), lv[1:0], "walk0-b");
+            end
+
+            // random pairs
+            for (k = 0; k < RANDOM; k = k + 1) begin
+                ra = {$urandom, $urandom};
+                rb = {$urandom, $urandom};
+                check(ra, rb, lv[1:0], "random");
+            end
+        end
+
+        #1;
+        if (errors == 0)
+            $display("PASS: operand_isolation - %0d vectors on all 4 levels (exact boundary, walking-1/0 on a and b, random) - bits above the boundary forced to 0, bits at/below passed unchanged, a and b independent.", n_vec);
+        else
+            $display("FAIL: operand_isolation - %0d mismatches in %0d vectors.", errors, n_vec);
+        $finish;
+    end
+
+endmodule
