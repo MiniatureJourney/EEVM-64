@@ -1,0 +1,62 @@
+// =============================================================================
+// Module   : operand_isolation
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.2; EEVM-64.pdf §3.3
+// Level    : Combinational (no clock, no reset)
+//
+// Function : Forces every bit ABOVE the precision boundary selected by `level` to 0
+//            on both operands at once, and passes the bits at/below it unchanged:
+//                level 00 : keep [ 7:0]   (bits 63:8  forced to 0)
+//                level 01 : keep [15:0]   (bits 63:16 forced to 0)
+//                level 10 : keep [31:0]   (bits 63:32 forced to 0)
+//                level 11 : keep [63:0]   (nothing forced)
+//            Held at a constant 0, the upper sub-multipliers of the Vedic tree
+//            receive no input transitions (EEVM-64.pdf §3.3).
+//
+// Implementation: the whole control is three shared segment enables decoded from the
+//            2-bit level (cumulative, so one AND per bit and no per-bit muxing):
+//                en16 = level != 0  (bits 15:8 live)
+//                en32 = level[1]    (bits 31:16 live)
+//                en64 = &level      (bits 63:32 live)
+//            Bits [7:0] are never gated. The same three enables drive a and b, so the
+//            two operands are always isolated to the same boundary, simultaneously.
+//            Cost: 112 two-input AND gates + 3 decode gates; no state.
+//
+// Usage notes:
+//   * Lossless when `level` comes from precision_detector AND the operands fed in
+//     here are the ones that detector measured as unsigned (or are the magnitudes of
+//     signed operands) — see tb_precision_chain. Do NOT feed raw negative
+//     two's-complement operands: bits 63:n are the sign copies and clearing them
+//     changes the value. The top level applies this module after the sign pre-stage
+//     (docs/phase2_design_decisions.md D7).
+//   * Per EEVM-64.pdf §3.3 isolation should sit at the hierarchical boundary, so keep
+//     this module as its own hierarchy level in the top-level integration rather than
+//     letting synthesis merge the ANDs into the tree.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module operand_isolation (
+    input  logic [63:0] a,
+    input  logic [63:0] b,
+    input  logic [1:0]  level,
+    output logic [63:0] a_iso,
+    output logic [63:0] b_iso
+);
+
+    logic en16, en32, en64;
+
+    assign en16 = level[1] | level[0];   // level >= 01
+    assign en32 = level[1];              // level >= 10
+    assign en64 = level[1] & level[0];   // level == 11
+
+    assign a_iso = {a[63:32] & {32{en64}},
+                    a[31:16] & {16{en32}},
+                    a[15:8]  & { 8{en16}},
+                    a[7:0]};
+
+    assign b_iso = {b[63:32] & {32{en64}},
+                    b[31:16] & {16{en32}},
+                    b[15:8]  & { 8{en16}},
+                    b[7:0]};
+
+endmodule
