@@ -1,0 +1,78 @@
+// =============================================================================
+// Module   : precision_detector
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.1; EEVM-64.pdf §3.2
+// Level    : Combinational (no clock, no reset)
+//
+// Function : Finds the smallest of the four datapath regions
+//                level 00 : operands fit in  8 bits
+//                level 01 : operands fit in 16 bits
+//                level 10 : operands fit in 32 bits
+//                level 11 : full 64 bits
+//            that holds BOTH operands (level = max(level_a, level_b)).
+//
+//              is_signed = 0 : a, b are unsigned.      X fits n bits  <=>  X[63:n] == 0
+//              is_signed = 1 : a, b are two's-complement. X fits n bits  <=>  X[63:n-1]
+//                                are all equal (the bits above the n-bit value are
+//                                redundant copies of its sign bit).
+//
+// Implementation (verified equal to an independent arithmetic reference over
+// all 2^129 inputs — see formal/ and docs/phase2_design_decisions.md D9):
+//   Build, per operand, a "significance" vector f
+//       unsigned : f[i] = x[i]
+//       signed   : f[i] = x[i] ^ x[i-1]      (a 1 marks a bit that differs from its
+//                                             lower neighbour, i.e. a non-redundant bit)
+//   Then "fits n bits" is simply  f[63:n] == 0  in BOTH modes, so one OR-reduction
+//   structure serves signed and unsigned. Two further savings:
+//     * max(level_a, level_b) is the level of the OR of the two f vectors (the
+//       position of the highest set bit of f_a | f_b is the larger of the two),
+//       so the two operands share a single set of segment OR-reductions;
+//     * only f[63:8] matters (anything at or below bit 7 fits 8 bits by definition),
+//       so a[6:0] / b[6:0] never reach the logic.
+//   Adjacent-bit XORs (rather than XOR with a broadcast sign bit) keep every net's
+//   fan-out at 2, which matters for ASIC buffering and for routing.
+//
+// Segment decode (priority, highest segment wins):
+//       or_hi  = |f[63:32]    -> level 11
+//       or_mid = |f[31:16]    -> level 10
+//       or_low = |f[15: 8]    -> level 01
+//       otherwise             -> level 00
+//
+// Usage notes (see docs/phase2_design_decisions.md D7/D8 before wiring the top level):
+//   * Isolation must be applied to MAGNITUDES, after the sign pre-stage. Driving
+//     operand_isolation with this level on raw negative operands would clear
+//     the sign-extension bits and flip the sign.
+//   * is_signed is ONE flag for both operands. Use 1 only when BOTH operands are
+//     signed (MUL treated as signed x signed, MULH); use 0 for MULHU and for MULHSU
+//     (a signed-looking detection of an unsigned operand >= 2^63 would be wrong).
+// =============================================================================
+`timescale 1ns / 1ps
+
+module precision_detector (
+    input  logic [63:0] a,
+    input  logic [63:0] b,
+    input  logic        is_signed,
+    output logic [1:0]  level
+);
+
+    // significance vectors, bits 63:8 only (bits below 8 always fit the 8-bit level)
+    logic [63:8] fa, fb;
+
+    assign fa = is_signed ? (a[63:8] ^ a[62:7]) : a[63:8];
+    assign fb = is_signed ? (b[63:8] ^ b[62:7]) : b[63:8];
+
+    logic or_hi, or_mid, or_low;
+
+    assign or_hi  = |{fa[63:32], fb[63:32]};
+    assign or_mid = |{fa[31:16], fb[31:16]};
+    assign or_low = |{fa[15:8],  fb[15:8]};
+
+    // 00 / 01 / 10 / 11 from the three segment flags (priority: hi > mid > low)
+    assign level[1] = or_hi | or_mid;
+    assign level[0] = or_hi | (~or_mid & or_low);
+
+    // a[6:0], b[6:0] are intentionally unused (they always fit the 8-bit level)
+    logic unused_ok;
+    assign unused_ok = &{1'b0, a[6:0], b[6:0]};
+
+endmodule
