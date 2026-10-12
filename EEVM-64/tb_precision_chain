@@ -1,0 +1,228 @@
+// =============================================================================
+// Testbench : tb_precision_chain
+// DUTs      : precision_detector -> operand_isolation, wired as the top level will
+// Purpose   : System-level check that the two blocks compose WITHOUT changing the
+//             value the multiplier tree has to compute. It also documents, with
+//             numbers, why the Phase 1 stage order (detector -> isolation -> sign
+//             pre-stage) had to change — see docs/phase2_design_decisions.md D7/D8.
+//
+// Properties checked on every vector (all must hold):
+//   P1  unsigned mode : isolation driven by the detector's level never alters
+//                       either operand            ->  a_iso == a  and  b_iso == b
+//   P2  signed mode   : the detector looks at the RAW two's-complement operands, but
+//                       isolation is applied to their MAGNITUDES (what the sign
+//                       pre-stage hands to the unsigned Vedic tree)
+//                       ->  iso(|a|) == |a|  and  iso(|b|) == |b|
+//   P3  MULHSU rule   : rs1 signed, rs2 unsigned, is_signed = 0 -> the chain is
+//                       lossless on (|rs1|, rs2)
+//
+// Hazard evidence (counted, reported, and REQUIRED to be non-zero so the ordering
+// decision stays justified):
+//   H1  signed mode, isolation applied to the RAW operands: how many vectors are
+//       corrupted (negative operands lose their sign-extension bits)
+//   H2  MULHSU with is_signed = 1: an unsigned rs2 >= 2^63 looks like a small
+//       negative number, the detector reports a low level, and isolating rs2
+//       corrupts it
+//
+// Pass/fail : prints one PASS/FAIL summary line for testingDataBlockwise.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_precision_chain #(
+    parameter int N_SHAPED = 60000
+);
+
+    logic [63:0] a, b;
+    logic        is_signed;
+    logic [1:0]  level;
+
+    precision_detector u_det (.a(a), .b(b), .is_signed(is_signed), .level(level));
+
+    // path 1: isolation on the operands exactly as given (raw)
+    logic [63:0] a_raw_iso, b_raw_iso;
+    operand_isolation u_iso_raw (.a(a), .b(b), .level(level), .a_iso(a_raw_iso), .b_iso(b_raw_iso));
+
+    // path 2: isolation on magnitudes (what the sign pre-stage delivers)
+    logic [63:0] ma, mb, ma_iso, mb_iso;
+    assign ma = (is_signed && a[63]) ? (~a + 64'd1) : a;
+    assign mb = (is_signed && b[63]) ? (~b + 64'd1) : b;
+    operand_isolation u_iso_mag (.a(ma), .b(mb), .level(level), .a_iso(ma_iso), .b_iso(mb_iso));
+
+    integer errors, n_vec, n_mulhsu, hazard_h1, hazard_h2;
+
+    // ---- helpers ------------------------------------------------------------------
+    function automatic int kept(input logic [1:0] l);
+        begin
+            case (l)
+                2'd0:    kept = 8;
+                2'd1:    kept = 16;
+                2'd2:    kept = 32;
+                default: kept = 64;
+            endcase
+        end
+    endfunction
+
+    // x survives isolation at level l  <=>  every bit at/above the boundary is 0
+    function automatic logic fits(input logic [63:0] x, input logic [1:0] l);
+        begin
+            if (kept(l) >= 64) fits = 1'b1;
+            else               fits = ((x >> kept(l)) == 64'd0);
+        end
+    endfunction
+
+    function automatic logic [63:0] rnd64();
+        rnd64 = {$urandom, $urandom};
+    endfunction
+
+    function automatic logic [63:0] low_mask(input int n);
+        begin
+            if (n >= 64)     low_mask = '1;
+            else if (n <= 0) low_mask = 64'd0;
+            else             low_mask = (64'(1) << n) - 64'(1);
+        end
+    endfunction
+
+    function automatic logic [63:0] gen_u(input int w);   // top set bit exactly w-1
+        begin
+            if (w <= 0) gen_u = 64'd0;
+            else        gen_u = (64'(1) << (w - 1)) | (rnd64() & low_mask(w - 1));
+        end
+    endfunction
+
+    function automatic logic [63:0] gen_s(input int w);   // needs exactly w bits signed
+        logic [63:0] p;
+        begin
+            if (w <= 1) gen_s = ($urandom & 1) ? '1 : 64'd0;
+            else begin
+                p = (64'(1) << (w - 2)) | (rnd64() & low_mask(w - 2));
+                gen_s = ($urandom & 1) ? ~p : p;
+            end
+        end
+    endfunction
+
+    // ---- P1 / P2 / H1 --------------------------------------------------------------
+    task automatic check(input logic [63:0] av, input logic [63:0] bv, input logic s, input string tag);
+        begin
+            a = av; b = bv; is_signed = s;
+            #1;
+            n_vec = n_vec + 1;
+            if (!s) begin
+                if (a_raw_iso !== a || b_raw_iso !== b) begin                    // P1
+                    errors = errors + 1;
+                    if (errors <= 10)
+                        $display("FAIL P1 [%s] a=%h b=%h level=%0d -> a_iso=%h b_iso=%h",
+                                 tag, av, bv, level, a_raw_iso, b_raw_iso);
+                end
+            end else begin
+                if (ma_iso !== ma || mb_iso !== mb) begin                        // P2
+                    errors = errors + 1;
+                    if (errors <= 10)
+                        $display("FAIL P2 [%s] a=%h b=%h level=%0d |a|=%h |b|=%h -> %h %h",
+                                 tag, av, bv, level, ma, mb, ma_iso, mb_iso);
+                end
+                if (a_raw_iso !== a || b_raw_iso !== b)                          // H1 (informational)
+                    hazard_h1 = hazard_h1 + 1;
+            end
+        end
+    endtask
+
+    // ---- P3 / H2 : MULHSU (rs1 signed, rs2 unsigned) ----------------------------------
+    task automatic check_mulhsu(input logic [63:0] rs1, input logic [63:0] rs2);
+        logic [63:0] m1;
+        logic [1:0]  lvl_rule;
+        begin
+            m1 = rs1[63] ? (~rs1 + 64'd1) : rs1;       // |rs1| as the sign pre-stage delivers it
+            n_mulhsu = n_mulhsu + 1;
+
+            // the rule: is_signed = 0 for MULHSU
+            a = rs1; b = rs2; is_signed = 1'b0;
+            #1;
+            lvl_rule = level;
+            if (!fits(m1, lvl_rule) || !fits(rs2, lvl_rule)) begin               // P3
+                errors = errors + 1;
+                if (errors <= 10)
+                    $display("FAIL P3 MULHSU rs1=%h rs2=%h level=%0d would lose bits", rs1, rs2, lvl_rule);
+            end
+
+            // the naive wiring: is_signed = 1 (rs2 is unsigned, so it must survive isolation)
+            is_signed = 1'b1;
+            #1;
+            if (!fits(rs2, level)) hazard_h2 = hazard_h2 + 1;                    // H2 (informational)
+
+            is_signed = 1'b0;
+            #1;
+        end
+    endtask
+
+    // ---- directed corner values ----------------------------------------------------------
+    localparam int ND = 12;
+    logic [63:0] dv [0:ND-1];
+    initial begin
+        dv[0]  = 64'h0;
+        dv[1]  = 64'h1;
+        dv[2]  = 64'hFFFFFFFFFFFFFFFF;
+        dv[3]  = 64'hFFFFFFFFFFFFFF80;
+        dv[4]  = 64'h0000000000000080;
+        dv[5]  = 64'hFFFFFFFFFFFF8000;
+        dv[6]  = 64'h0000000000008000;
+        dv[7]  = 64'hFFFFFFFF80000000;
+        dv[8]  = 64'h0000000080000000;
+        dv[9]  = 64'h7FFFFFFFFFFFFFFF;
+        dv[10] = 64'h8000000000000000;
+        dv[11] = 64'hFFFFFFFFFFFFFFFB;   // -5
+    end
+
+    integer i, j, k, m, wa, wb;
+
+    initial begin
+        $dumpfile("tb_precision_chain.vcd");
+        $dumpvars(0, tb_precision_chain);
+        errors = 0; n_vec = 0; n_mulhsu = 0; hazard_h1 = 0; hazard_h2 = 0;
+        #1;
+
+        // directed corner pairs, both modes
+        for (m = 0; m < 2; m = m + 1)
+            for (i = 0; i < ND; i = i + 1)
+                for (j = 0; j < ND; j = j + 1)
+                    check(dv[i], dv[j], m[0], "directed");
+
+        // width-shaped random, both modes
+        for (k = 0; k < N_SHAPED; k = k + 1) begin
+            wa = $urandom % 65;
+            wb = $urandom % 65;
+            if ($urandom & 1) check(gen_u(wa), gen_u(wb), 1'b0, "shaped-u");
+            else              check(gen_s(wa), gen_s(wb), 1'b1, "shaped-s");
+        end
+
+        // MULHSU: rs1 signed, rs2 unsigned. The first four are the targeted
+        // counter-example set (rs2 is an unsigned value that looks like a small negative number).
+        check_mulhsu(64'hFFFFFFFFFFFFFFFB, 64'hFFFFFFFFFFFFFFF0);   // -5,   2^64-16
+        check_mulhsu(64'hFFFFFFFFFFFFFF80, 64'hFFFFFFFFFFFF8000);   // -128, 2^64-2^15
+        check_mulhsu(64'h0000000000000005, 64'hFFFFFFFF80000000);    //  5,   2^64-2^31
+        check_mulhsu(64'h8000000000000000, 64'hFFFFFFFFFFFFFFFF);   // -2^63, 2^64-1
+        for (k = 0; k < N_SHAPED / 4; k = k + 1) begin
+            wa = $urandom % 65;
+            wb = $urandom % 65;
+            check_mulhsu(gen_s(wa), gen_u(wb));
+            check_mulhsu(gen_s(wa), gen_s(wb));        // rs2 given as a sign-extended pattern
+        end
+
+        #1;
+        if (hazard_h1 == 0) begin
+            errors = errors + 1;
+            $display("FAIL: hazard H1 never observed - the raw-operand isolation counter-example vectors are missing");
+        end
+        if (hazard_h2 == 0) begin
+            errors = errors + 1;
+            $display("FAIL: hazard H2 never observed - the MULHSU counter-example vectors are missing");
+        end
+
+        if (errors == 0)
+            $display("PASS: precision chain - %0d vectors + %0d MULHSU vectors: isolation after the detector is lossless (unsigned operands, signed magnitudes, MULHSU rule is_signed=0). Hazards demonstrated: raw-signed isolation corrupts %0d signed vectors; is_signed=1 on MULHSU would corrupt %0d of %0d MULHSU vectors.",
+                     n_vec, n_mulhsu, hazard_h1, hazard_h2, n_mulhsu);
+        else
+            $display("FAIL: precision chain - %0d errors in %0d vectors.", errors, n_vec + n_mulhsu);
+        $finish;
+    end
+
+endmodule
