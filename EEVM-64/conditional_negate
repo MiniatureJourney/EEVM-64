@@ -1,0 +1,84 @@
+// =============================================================================
+// Module   : conditional_negate
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.3 (sign-handling wrapper) — the
+//            negate that both the pre-stage and the post-stage need
+// Level    : Combinational, parameterized width
+//
+// Function : y = x            when neg = 0
+//            y = -x           when neg = 1 and low_nz = 0     (~x + 1)
+//            y = ~x           when neg = 1 and low_nz = 1
+//
+//            low_nz says "some lower-order part of the same number is non-zero". It
+//            is the carry the +1 would otherwise receive: negating a long number is
+//            "invert everything above the lowest set bit", so if a set bit already
+//            exists below this slice the whole slice simply inverts. The pre-stage
+//            ties it to 0 (the slice is the whole operand). The post-stage uses it
+//            to negate the HIGH half of the 128-bit product on its own, from the
+//            high half alone plus one bit ("is the low half non-zero?").
+//
+// STYLE (both proved bit-exact over all inputs, formal/run_blocks_12_13.sh):
+//   "CARRY_CHAIN" (default) y = neg ? ~x + ~low_nz : x   — an incrementer; maps onto
+//                the FPGA carry chain (smallest on Artix-7: ~W LUTs + W/4 CARRY4).
+//   "PREFIX_TREE" y[i] = x[i] ^ (neg & (low_nz | |x[i-1:0])) with the prefix-OR built
+//                as a Sklansky tree (log2 W levels, no carry chain). Shallowest
+//                for an ASIC flow, at ~30% more gates than the arithmetic form (generic
+//                gate count, Yosys, W = 64: 253 vs 194).
+//            Pick per target with the NEG_STYLE parameter of the sign stages; an
+//            unrecognised value falls back to "CARRY_CHAIN". (The two names are the
+//            same length on purpose, so tools do not warn about the string compare.)
+//
+// Edge cases: x = 0 stays 0 (nothing to invert above a set bit); the most negative
+// value -2^(W-1) negates to itself, which is correct when the result is read as an
+// UNSIGNED magnitude (2^(W-1)) — the way the sign pre-stage uses it.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module conditional_negate #(
+    parameter int    W     = 64,
+    parameter     STYLE = "CARRY_CHAIN"  // "CARRY_CHAIN" | "PREFIX_TREE"
+) (
+    input  logic [W-1:0] x,
+    input  logic         neg,
+    input  logic         low_nz,
+    output logic [W-1:0] y
+);
+
+    generate
+        if (STYLE == "PREFIX_TREE") begin : g_prefix
+            localparam int L = (W > 1) ? $clog2(W) : 0;
+
+            // pf[k][i] = OR of x[i : i - 2^k + 1 (rounded to the Sklansky block)]; pf[L][i] = |x[i:0]
+            logic [W-1:0] pf [0:L];
+            assign pf[0] = x;
+            for (genvar k = 1; k <= L; k++) begin : g_lv
+                for (genvar i = 0; i < W; i++) begin : g_bit
+                    if (((i >> (k-1)) & 1) == 1) begin : g_or
+                        assign pf[k][i] = pf[k-1][i] | pf[k-1][((i >> (k-1)) << (k-1)) - 1];
+                    end else begin : g_pass
+                        assign pf[k][i] = pf[k-1][i];
+                    end
+                end
+            end
+
+            logic flip_all;                       // a lower set bit already exists: flip the whole slice
+            assign flip_all = neg & low_nz;
+            assign y[0] = x[0] ^ flip_all;
+            for (genvar i = 1; i < W; i++) begin : g_out
+                assign y[i] = x[i] ^ (flip_all | (neg & pf[L][i-1]));
+            end
+
+            // pf[L][W-1] (the inclusive OR of the whole slice) is not needed
+            logic unused_ok;
+            assign unused_ok = &{1'b0, pf[L][W-1]};
+        end else begin : g_arith
+            logic [W-1:0] inc;                    // the +1, unless a lower set bit already absorbed it
+            always_comb begin
+                inc    = '0;
+                inc[0] = ~low_nz;
+            end
+            assign y = neg ? (~x + inc) : x;
+        end
+    endgenerate
+
+endmodule
