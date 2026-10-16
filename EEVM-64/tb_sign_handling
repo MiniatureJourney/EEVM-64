@@ -1,0 +1,518 @@
+// =============================================================================
+// Testbench : tb_sign_handling
+// DUTs      : conditional_negate, sign_prestage, sign_poststage (both NEG_STYLEs),
+//             and — in the 64-bit end-to-end instances — precision_detector and
+//             operand_isolation wired exactly as the top level will wire them
+// Spec ref  : EEVM-64_architecturePlan.pdf §2.3 and §4 ("Sign wrapper: explicit
+//             MULHSU vectors with rs1 negative and rs2 at values that would be
+//             negative if misread as signed")
+//
+// Three kinds of check, all self-checking:
+//
+//  1. conditional_negate  — compared with plain arithmetic on a longer number:
+//       the slice is the top part of {x, low}, low is non-zero iff low_nz, and the
+//       reference simply negates the whole concatenation. EXHAUSTIVE over
+//       (x, neg, low_nz) for W = 1, 2, 5, 8, 13 (13 is not a power of two), and
+//       directed + random for W = 64, for both STYLEs.
+//
+//  2. sign_poststage      — result must equal the chosen half of (neg ? -p : p) for
+//       ANY 128-bit p, not just real products: EXHAUSTIVE at XLEN = 4 and 6,
+//       directed + random at XLEN = 64 (including the carry case "low half = 0,
+//       high half != 0" that the half-select optimisation depends on).
+//
+//  3. End-to-end M-extension check — rs1, rs2, op_sel -> sign_prestage -> (a
+//       behavioural unsigned multiplier standing in for the Vedic tree) ->
+//       sign_poststage, compared with a golden RV64M model that multiplies
+//       sign/zero-extended operands at double width:
+//           MUL    = low(sa*sb)   MULH = high(sa*sb)
+//           MULHSU = high(sa*ub)  MULHU = high(ua*ub)
+//       and the three control bits (neg, hi, is_signed) are checked against an
+//       explicit table. Instances:
+//         XLEN = 8   EXHAUSTIVE: all 65,536 operand pairs x 4 ops   (CARRY_CHAIN; XLEN = 7 for PREFIX_TREE)
+//         XLEN = 16  random + width-shaped                          (both STYLEs)
+//         XLEN = 64  directed cross (incl. the MULHSU counter-examples) + width-
+//                    shaped random + random, with precision_detector and
+//                    operand_isolation IN THE PATH (D7: sign stage first,
+//                    isolation on magnitudes; D8: the is_signed mapping). Any
+//                    mistake in that wiring changes the result and fails here.
+//         Coverage required: every (op, level) pair hit, and a negative result
+//         seen for MUL, MULH and MULHSU.
+//
+// Pass/fail : prints one PASS/FAIL summary line for testingDataBlockwise.
+// =============================================================================
+`timescale 1ns / 1ps
+
+// ---------------------------------------------------------------------------------
+// 1. conditional_negate checker
+// ---------------------------------------------------------------------------------
+module cn_checker #(
+    parameter int W          = 8,
+    parameter     STYLE      = "CARRY_CHAIN",
+    parameter int EXHAUSTIVE = 1,        // 1: every (x, neg, low_nz); 0: directed + N_RANDOM random
+    parameter int N_RANDOM   = 0
+) (
+    output logic        done,
+    output logic [31:0] errs,
+    output logic [31:0] nvec
+);
+    localparam int LB = 6;                       // width of the "lower part" of the long number
+
+    logic [W-1:0] x, y;
+    logic         neg, low_nz;
+    conditional_negate #(.W(W), .STYLE(STYLE)) dut (.x(x), .neg(neg), .low_nz(low_nz), .y(y));
+
+    // reference: negate the whole number {x, lower} with ordinary arithmetic
+    function automatic logic [W-1:0] ref_y(input logic [W-1:0] xv, input logic n,
+                                           input logic lz, input logic [LB-1:0] lowv);
+        logic [W+LB-1:0] num, res;
+        logic [LB-1:0]   lw;
+        begin
+            lw  = lz ? ((lowv == '0) ? {{(LB-1){1'b0}}, 1'b1} : lowv) : '0;   // non-zero iff lz
+            num = {xv, lw};
+            res = n ? ({(W+LB){1'b0}} - num) : num;
+            ref_y = res[W+LB-1:LB];
+        end
+    endfunction
+
+    task automatic check(input logic [W-1:0] xv, input logic n, input logic lz, input logic [LB-1:0] lowv);
+        logic [W-1:0] e;
+        begin
+            x = xv; neg = n; low_nz = lz;
+            #1;
+            nvec = nvec + 1;
+            e = ref_y(xv, n, lz, lowv);
+            if (y !== e) begin
+                errs = errs + 1;
+                if (errs <= 5)
+                    $display("FAIL conditional_negate W=%0d %s x=%h neg=%b low_nz=%b -> %h (expected %h)", W, STYLE, xv, n, lz, y, e);
+            end
+        end
+    endtask
+
+    // alternating 0101.. / 1010.. pattern of width W (no zero-width replication)
+    function automatic logic [W-1:0] alt(input int phase);
+        logic [W-1:0] r;
+        begin
+            for (int q = 0; q < W; q++) r[q] = ((q % 2) == phase);
+            alt = r;
+        end
+    endfunction
+
+    integer i, j, k;
+    logic [W-1:0]  xi;
+    logic [LB-1:0] lowsel [0:3];
+
+    initial begin
+        done = 1'b0; errs = 0; nvec = 0;
+        lowsel[0] = 6'd1; lowsel[1] = 6'h20; lowsel[2] = 6'h3F; lowsel[3] = 6'h15;
+        #1;
+        if (EXHAUSTIVE != 0) begin
+            for (i = 0; i < (1 << W); i = i + 1)
+                for (j = 0; j < 2; j = j + 1)
+                    for (k = 0; k < 2; k = k + 1) begin
+                        xi = i;
+                        check(xi, j[0], k[0], lowsel[(i + j + k) % 4]);
+                    end
+        end else begin
+            // directed
+            for (j = 0; j < 2; j = j + 1)
+                for (k = 0; k < 2; k = k + 1) begin
+                    check('0,                      j[0], k[0], lowsel[0]);
+                    check('1,                      j[0], k[0], lowsel[1]);
+                    check({1'b1, {(W-1){1'b0}}},   j[0], k[0], lowsel[2]);   // most negative
+                    check({1'b0, {(W-1){1'b1}}},   j[0], k[0], lowsel[3]);   // most positive
+                    check({{(W-1){1'b0}}, 1'b1},   j[0], k[0], lowsel[0]);
+                    check(alt(0),                  j[0], k[0], lowsel[1]);
+                    check(alt(1),                  j[0], k[0], lowsel[2]);
+                    for (i = 0; i < W; i = i + 1) begin
+                        check(({{(W-1){1'b0}}, 1'b1}) << i,   j[0], k[0], lowsel[i % 4]);   // walking one
+                        check(~(({{(W-1){1'b0}}, 1'b1}) << i), j[0], k[0], lowsel[i % 4]);  // walking zero
+                    end
+                end
+            for (i = 0; i < N_RANDOM; i = i + 1)
+                check({$urandom, $urandom}, $urandom & 1, $urandom & 1, $urandom);
+        end
+        #1;
+        done = 1'b1;
+    end
+endmodule
+
+// ---------------------------------------------------------------------------------
+// 2. sign_poststage checker (arbitrary p, not just real products)
+// ---------------------------------------------------------------------------------
+module post_checker #(
+    parameter int XLEN       = 8,
+    parameter     STYLE      = "CARRY_CHAIN",
+    parameter int EXHAUSTIVE = 1,
+    parameter int N_RANDOM   = 0
+) (
+    output logic        done,
+    output logic [31:0] errs,
+    output logic [31:0] nvec
+);
+    logic [2*XLEN-1:0] p;
+    logic              neg, hi;
+    logic [XLEN-1:0]   result;
+    sign_poststage #(.XLEN(XLEN), .NEG_STYLE(STYLE)) dut (.p(p), .neg(neg), .hi(hi), .result(result));
+
+    // reference: negate the WHOLE 2*XLEN-bit product, then slice
+    function automatic logic [XLEN-1:0] ref_result(input logic [2*XLEN-1:0] pv, input logic n, input logic h);
+        logic [2*XLEN-1:0] full;
+        begin
+            full = n ? ({(2*XLEN){1'b0}} - pv) : pv;
+            ref_result = h ? full[2*XLEN-1:XLEN] : full[XLEN-1:0];
+        end
+    endfunction
+
+    task automatic check(input logic [2*XLEN-1:0] pv, input logic n, input logic h);
+        logic [XLEN-1:0] e;
+        begin
+            p = pv; neg = n; hi = h;
+            #1;
+            nvec = nvec + 1;
+            e = ref_result(pv, n, h);
+            if (result !== e) begin
+                errs = errs + 1;
+                if (errs <= 5)
+                    $display("FAIL sign_poststage XLEN=%0d %s p=%h neg=%b hi=%b -> %h (expected %h)", XLEN, STYLE, pv, n, h, result, e);
+            end
+        end
+    endtask
+
+    integer i, j, k;
+    logic [2*XLEN-1:0] one, pi;
+    initial begin
+        done = 1'b0; errs = 0; nvec = 0;
+        one = {{(2*XLEN-1){1'b0}}, 1'b1};
+        #1;
+        if (EXHAUSTIVE != 0) begin
+            for (i = 0; i < (1 << (2*XLEN)); i = i + 1)
+                for (j = 0; j < 2; j = j + 1)
+                    for (k = 0; k < 2; k = k + 1) begin
+                        pi = i;
+                        check(pi, j[0], k[0]);
+                    end
+        end else begin
+            for (j = 0; j < 2; j = j + 1)
+                for (k = 0; k < 2; k = k + 1) begin
+                    check('0, j[0], k[0]);
+                    check('1, j[0], k[0]);
+                    check(one << XLEN,                         j[0], k[0]);   // low half 0, high half 1: carry case
+                    check(one << (2*XLEN-1),                   j[0], k[0]);   // 2^127
+                    check((one << XLEN) - one,                 j[0], k[0]);   // low half all ones, high 0
+                    check({{XLEN{1'b1}}, {XLEN{1'b0}}},        j[0], k[0]);   // high all ones, low 0
+                    check({{XLEN{1'b0}}, {XLEN{1'b1}}},        j[0], k[0]);
+                    check(one,                                 j[0], k[0]);
+                    for (i = 0; i < 2*XLEN; i = i + 1) begin
+                        check(one << i,   j[0], k[0]);                         // walking one
+                        check(~(one << i), j[0], k[0]);                        // walking zero
+                        check((one << i) - one, j[0], k[0]);                   // run of ones from bit 0
+                    end
+                end
+            for (i = 0; i < N_RANDOM; i = i + 1) begin
+                // half the vectors have an all-zero low half so the carry case is common
+                if ($urandom & 1) check({$urandom, $urandom, $urandom, $urandom}, $urandom & 1, $urandom & 1);
+                else              check({{$urandom, $urandom}, 64'd0},           $urandom & 1, $urandom & 1);
+            end
+        end
+        #1;
+        done = 1'b1;
+    end
+endmodule
+
+// ---------------------------------------------------------------------------------
+// 3. End-to-end RV64M-style check
+// ---------------------------------------------------------------------------------
+module sign_chain_check #(
+    parameter int XLEN      = 8,
+    parameter     NEG_STYLE = "CARRY_CHAIN",
+    parameter int MODE      = 0,         // 0 exhaustive, 1 shaped + random, 2 directed + shaped + random
+    parameter int N_SHAPED  = 0,
+    parameter int N_RANDOM  = 0,
+    parameter int FRONT     = 0          // 1: precision_detector + operand_isolation in the path (XLEN = 64)
+) (
+    output logic        done,
+    output logic [31:0] errs,
+    output logic [31:0] nvec
+);
+    logic [XLEN-1:0] rs1, rs2;
+    logic [1:0]      op;
+    logic [XLEN-1:0] a_mag, b_mag, a_use, b_use, result;
+    logic            neg, hi, is_signed;
+    logic [1:0]      level;
+    logic [2*XLEN-1:0] prod;
+
+    sign_prestage  #(.XLEN(XLEN), .NEG_STYLE(NEG_STYLE)) u_pre  (.rs1(rs1), .rs2(rs2), .op_sel(op),
+                     .a_mag(a_mag), .b_mag(b_mag), .neg(neg), .hi(hi), .is_signed(is_signed));
+    sign_poststage #(.XLEN(XLEN), .NEG_STYLE(NEG_STYLE)) u_post (.p(prod), .neg(neg), .hi(hi), .result(result));
+
+    generate
+        if (FRONT != 0) begin : g_front
+            // detector reads the RAW operands (D7); isolation is applied to the magnitudes
+            precision_detector u_det (.a(rs1), .b(rs2), .is_signed(is_signed), .level(level));
+            operand_isolation  u_iso (.a(a_mag), .b(b_mag), .level(level), .a_iso(a_use), .b_iso(b_use));
+        end else begin : g_nofront
+            assign level = 2'd0;
+            assign a_use = a_mag;
+            assign b_use = b_mag;
+        end
+    endgenerate
+
+    assign prod = a_use * b_use;                 // unsigned, double width: stands in for the Vedic tree
+
+    // ---- golden model: multiply sign/zero-extended operands at double width ------------
+    function automatic logic [XLEN-1:0] golden(input logic [1:0] o, input logic [XLEN-1:0] a, input logic [XLEN-1:0] b);
+        logic signed [2*XLEN-1:0] sa, sb, ua, ub, pr;
+        begin
+            sa = {{XLEN{a[XLEN-1]}}, a};
+            sb = {{XLEN{b[XLEN-1]}}, b};
+            ua = {{XLEN{1'b0}}, a};
+            ub = {{XLEN{1'b0}}, b};
+            case (o)
+                2'b00:   begin pr = sa * sb; golden = pr[XLEN-1:0];        end   // MUL
+                2'b01:   begin pr = sa * sb; golden = pr[2*XLEN-1:XLEN];   end   // MULH
+                2'b10:   begin pr = sa * ub; golden = pr[2*XLEN-1:XLEN];   end   // MULHSU
+                default: begin pr = ua * ub; golden = pr[2*XLEN-1:XLEN];   end   // MULHU
+            endcase
+        end
+    endfunction
+
+    logic [3:0]  neg_seen;                        // by op
+    logic [15:0] cov;                             // {op, level}
+
+    task automatic check(input logic [XLEN-1:0] a, input logic [XLEN-1:0] b, input logic [1:0] o);
+        logic [XLEN-1:0] e, em_a, em_b;
+        logic            e_neg, e_hi, e_sg, a_sg, b_sg;
+        begin
+            rs1 = a; rs2 = b; op = o;
+            #1;
+            nvec = nvec + 1;
+            e = golden(o, a, b);
+            if (result !== e) begin
+                errs = errs + 1;
+                if (errs <= 8)
+                    $display("FAIL result XLEN=%0d %s op=%0d rs1=%h rs2=%h -> %h (expected %h)", XLEN, NEG_STYLE, o, a, b, result, e);
+            end
+
+            // control bits from an explicit table
+            e_hi = (o != 2'b00);
+            e_sg = (o == 2'b00) || (o == 2'b01);
+            case (o)
+                2'b00, 2'b01: e_neg = a[XLEN-1] ^ b[XLEN-1];
+                2'b10:        e_neg = a[XLEN-1];
+                default:      e_neg = 1'b0;
+            endcase
+            if (hi !== e_hi || is_signed !== e_sg || neg !== e_neg) begin
+                errs = errs + 1;
+                if (errs <= 8)
+                    $display("FAIL decode XLEN=%0d op=%0d rs1=%h rs2=%h -> neg=%b hi=%b is_signed=%b (expected %b %b %b)",
+                             XLEN, o, a, b, neg, hi, is_signed, e_neg, e_hi, e_sg);
+            end
+
+            // magnitudes: |x| for an operand treated as signed, x itself otherwise
+            a_sg = (o != 2'b11);
+            b_sg = (o == 2'b00) || (o == 2'b01);
+            em_a = (a_sg && a[XLEN-1]) ? (~a + 1'b1) : a;
+            em_b = (b_sg && b[XLEN-1]) ? (~b + 1'b1) : b;
+            if (a_mag !== em_a || b_mag !== em_b) begin
+                errs = errs + 1;
+                if (errs <= 8)
+                    $display("FAIL magnitude XLEN=%0d op=%0d rs1=%h rs2=%h -> %h %h (expected %h %h)", XLEN, o, a, b, a_mag, b_mag, em_a, em_b);
+            end
+
+            if (neg) neg_seen[o] = 1'b1;
+            if (FRONT != 0) cov[{o, level}] = 1'b1;
+        end
+    endtask
+
+    // ---- stimulus helpers ---------------------------------------------------------------
+    function automatic logic [XLEN-1:0] rndx();
+        logic [63:0] r;
+        begin r = {$urandom, $urandom}; rndx = r[XLEN-1:0]; end
+    endfunction
+    function automatic logic [XLEN-1:0] low_mask(input int n);
+        logic [63:0] m;
+        begin
+            if (n >= 64)     m = '1;
+            else if (n <= 0) m = 64'd0;
+            else             m = (64'(1) << n) - 64'(1);
+            low_mask = m[XLEN-1:0];
+        end
+    endfunction
+    function automatic logic [XLEN-1:0] gen_u(input int w);       // top set bit exactly w-1
+        logic [XLEN-1:0] one;
+        begin
+            one = {{(XLEN-1){1'b0}}, 1'b1};
+            if (w <= 0) gen_u = '0;
+            else        gen_u = (one << (w - 1)) | (rndx() & low_mask(w - 1));
+        end
+    endfunction
+    function automatic logic [XLEN-1:0] gen_s(input int w);       // needs exactly w bits two's complement
+        logic [XLEN-1:0] one, pv;
+        begin
+            one = {{(XLEN-1){1'b0}}, 1'b1};
+            if (w <= 1) gen_s = ($urandom & 1) ? '1 : '0;
+            else begin
+                pv = (one << (w - 2)) | (rndx() & low_mask(w - 2));
+                gen_s = ($urandom & 1) ? ~pv : pv;
+            end
+        end
+    endfunction
+
+    // directed values (used when MODE == 2, XLEN == 64)
+    localparam int ND = 32;
+    logic [63:0] dv [0:ND-1];
+    initial begin
+        dv[0]  = 64'h0000000000000000;  dv[1]  = 64'h0000000000000001;  dv[2]  = 64'hFFFFFFFFFFFFFFFF;
+        dv[3]  = 64'h0000000000000002;  dv[4]  = 64'hFFFFFFFFFFFFFFFE;  dv[5]  = 64'h000000000000007F;
+        dv[6]  = 64'h0000000000000080;  dv[7]  = 64'hFFFFFFFFFFFFFF80;  dv[8]  = 64'hFFFFFFFFFFFFFF7F;
+        dv[9]  = 64'h00000000000000FF;  dv[10] = 64'h0000000000000100;  dv[11] = 64'h0000000000007FFF;
+        dv[12] = 64'h0000000000008000;  dv[13] = 64'hFFFFFFFFFFFF8000;  dv[14] = 64'hFFFFFFFFFFFF7FFF;
+        dv[15] = 64'h000000000000FFFF;  dv[16] = 64'h0000000000010000;  dv[17] = 64'h000000007FFFFFFF;
+        dv[18] = 64'h0000000080000000;  dv[19] = 64'hFFFFFFFF80000000;  dv[20] = 64'hFFFFFFFF7FFFFFFF;
+        dv[21] = 64'h00000000FFFFFFFF;  dv[22] = 64'h0000000100000000;  dv[23] = 64'h7FFFFFFFFFFFFFFF;
+        dv[24] = 64'h8000000000000000;  dv[25] = 64'h8000000000000001;  dv[26] = 64'h5555555555555555;
+        dv[27] = 64'hAAAAAAAAAAAAAAAA;  dv[28] = 64'h00000000AAAAAAAA;  dv[29] = 64'hFFFFFFFFFFFF5555;
+        dv[30] = 64'hFFFFFFFFFFFFFFFB;  dv[31] = 64'hFFFFFFFFFFFFFFF0;
+    end
+
+    integer i, j, k, m, wa, wb, holes;
+    logic [XLEN-1:0] xa, xb;
+    initial begin
+        done = 1'b0; errs = 0; nvec = 0; neg_seen = '0; cov = '0;
+        #2;
+
+        if (MODE == 0) begin                                       // exhaustive
+            for (m = 0; m < 4; m = m + 1)
+                for (i = 0; i < (1 << XLEN); i = i + 1)
+                    for (j = 0; j < (1 << XLEN); j = j + 1) begin
+                        xa = i; xb = j;
+                        check(xa, xb, m[1:0]);
+                    end
+        end else begin
+            if (MODE == 2) begin                                   // directed cross, every op
+                for (m = 0; m < 4; m = m + 1)
+                    for (i = 0; i < ND; i = i + 1)
+                        for (j = 0; j < ND; j = j + 1)
+                            begin xa = dv[i]; xb = dv[j]; check(xa, xb, m[1:0]); end
+                // MULHSU counter-examples from the spec: rs1 negative, rs2 unsigned and
+                // looking like a small negative number if misread as signed
+                check(64'hFFFFFFFFFFFFFFFB, 64'hFFFFFFFFFFFFFFF0, 2'b10);
+                check(64'hFFFFFFFFFFFFFF80, 64'hFFFFFFFFFFFF8000, 2'b10);
+                check(64'h0000000000000005, 64'hFFFFFFFF80000000, 2'b10);
+                check(64'h8000000000000000, 64'hFFFFFFFFFFFFFFFF, 2'b10);
+                check(64'h8000000000000000, 64'h8000000000000000, 2'b00);   // -2^63 * -2^63
+                check(64'h8000000000000000, 64'h8000000000000000, 2'b01);
+                check(64'h8000000000000000, 64'h8000000000000000, 2'b11);
+            end
+            for (k = 0; k < N_SHAPED; k = k + 1) begin             // width-shaped random: small values and sign-extended negatives
+                wa = $urandom % (XLEN + 1);
+                wb = $urandom % (XLEN + 1);
+                m  = $urandom % 4;
+                case ($urandom % 3)
+                    0: check(gen_u(wa), gen_u(wb), m[1:0]);
+                    1: check(gen_s(wa), gen_s(wb), m[1:0]);
+                    default: check(gen_s(wa), gen_u(wb), m[1:0]);
+                endcase
+            end
+            for (k = 0; k < N_RANDOM; k = k + 1)
+                check(rndx(), rndx(), ($urandom % 4));
+        end
+
+        #1;
+        // coverage requirements
+        if (neg_seen[0] == 1'b0 || neg_seen[1] == 1'b0 || neg_seen[2] == 1'b0) begin
+            errs = errs + 1;
+            $display("FAIL coverage XLEN=%0d: no negative result seen for MUL/MULH/MULHSU (%b)", XLEN, neg_seen[2:0]);
+        end
+        if (FRONT != 0) begin
+            holes = 0;
+            for (i = 0; i < 16; i = i + 1) if (!cov[i]) holes = holes + 1;
+            if (holes != 0) begin
+                errs = errs + holes;
+                $display("FAIL coverage XLEN=%0d: %0d of 16 (op, level) pairs never exercised (%b)", XLEN, holes, cov);
+            end
+        end
+        done = 1'b1;
+    end
+endmodule
+
+// ---------------------------------------------------------------------------------
+// top
+// ---------------------------------------------------------------------------------
+module tb_sign_handling #(
+    parameter int N_CN_RANDOM   = 10000,
+    parameter int N_POST_RANDOM = 15000,
+    parameter int N16           = 20000,
+    parameter int N64_SHAPED    = 20000,
+    parameter int N64_RANDOM    = 5000,
+    parameter int XLEN_EXH      = 8,         // exhaustive end-to-end width, CARRY_CHAIN (8 -> 65,536 pairs x 4 ops)
+    parameter int XLEN_EXH_PT   = 7          // exhaustive end-to-end width, PREFIX_TREE
+);
+    localparam int NCN = 14, NPO = 6, NCH = 6;
+    logic [NCN-1:0] cn_done;   logic [32*NCN-1:0] cn_errs, cn_n;
+    logic [NPO-1:0] po_done;   logic [32*NPO-1:0] po_errs, po_n;
+    logic [NCH-1:0] ch_done;   logic [32*NCH-1:0] ch_errs, ch_n;
+
+    // 1. conditional_negate
+    cn_checker #(.W(1),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) c0  (.done(cn_done[0]),  .errs(cn_errs[ 0*32 +: 32]), .nvec(cn_n[ 0*32 +: 32]));
+    cn_checker #(.W(1),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) c1  (.done(cn_done[1]),  .errs(cn_errs[ 1*32 +: 32]), .nvec(cn_n[ 1*32 +: 32]));
+    cn_checker #(.W(2),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) c2  (.done(cn_done[2]),  .errs(cn_errs[ 2*32 +: 32]), .nvec(cn_n[ 2*32 +: 32]));
+    cn_checker #(.W(2),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) c3  (.done(cn_done[3]),  .errs(cn_errs[ 3*32 +: 32]), .nvec(cn_n[ 3*32 +: 32]));
+    cn_checker #(.W(5),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) c4  (.done(cn_done[4]),  .errs(cn_errs[ 4*32 +: 32]), .nvec(cn_n[ 4*32 +: 32]));
+    cn_checker #(.W(5),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) c5  (.done(cn_done[5]),  .errs(cn_errs[ 5*32 +: 32]), .nvec(cn_n[ 5*32 +: 32]));
+    cn_checker #(.W(8),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) c6  (.done(cn_done[6]),  .errs(cn_errs[ 6*32 +: 32]), .nvec(cn_n[ 6*32 +: 32]));
+    cn_checker #(.W(8),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) c7  (.done(cn_done[7]),  .errs(cn_errs[ 7*32 +: 32]), .nvec(cn_n[ 7*32 +: 32]));
+    cn_checker #(.W(13), .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) c8  (.done(cn_done[8]),  .errs(cn_errs[ 8*32 +: 32]), .nvec(cn_n[ 8*32 +: 32]));
+    cn_checker #(.W(13), .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) c9  (.done(cn_done[9]),  .errs(cn_errs[ 9*32 +: 32]), .nvec(cn_n[ 9*32 +: 32]));
+    cn_checker #(.W(64), .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(0), .N_RANDOM(N_CN_RANDOM)) c10 (.done(cn_done[10]), .errs(cn_errs[10*32 +: 32]), .nvec(cn_n[10*32 +: 32]));
+    cn_checker #(.W(64), .STYLE("PREFIX_TREE"), .EXHAUSTIVE(0), .N_RANDOM(N_CN_RANDOM)) c11 (.done(cn_done[11]), .errs(cn_errs[11*32 +: 32]), .nvec(cn_n[11*32 +: 32]));
+    cn_checker #(.W(33), .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(0), .N_RANDOM(N_CN_RANDOM / 4)) c12 (.done(cn_done[12]), .errs(cn_errs[12*32 +: 32]), .nvec(cn_n[12*32 +: 32]));
+    cn_checker #(.W(33), .STYLE("PREFIX_TREE"), .EXHAUSTIVE(0), .N_RANDOM(N_CN_RANDOM / 4)) c13 (.done(cn_done[13]), .errs(cn_errs[13*32 +: 32]), .nvec(cn_n[13*32 +: 32]));
+
+    // 2. sign_poststage
+    post_checker #(.XLEN(4),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) p0 (.done(po_done[0]), .errs(po_errs[0*32 +: 32]), .nvec(po_n[0*32 +: 32]));
+    post_checker #(.XLEN(4),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) p1 (.done(po_done[1]), .errs(po_errs[1*32 +: 32]), .nvec(po_n[1*32 +: 32]));
+    post_checker #(.XLEN(6),  .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(1)) p2 (.done(po_done[2]), .errs(po_errs[2*32 +: 32]), .nvec(po_n[2*32 +: 32]));
+    post_checker #(.XLEN(6),  .STYLE("PREFIX_TREE"), .EXHAUSTIVE(1)) p3 (.done(po_done[3]), .errs(po_errs[3*32 +: 32]), .nvec(po_n[3*32 +: 32]));
+    post_checker #(.XLEN(64), .STYLE("CARRY_CHAIN"), .EXHAUSTIVE(0), .N_RANDOM(N_POST_RANDOM)) p4 (.done(po_done[4]), .errs(po_errs[4*32 +: 32]), .nvec(po_n[4*32 +: 32]));
+    post_checker #(.XLEN(64), .STYLE("PREFIX_TREE"), .EXHAUSTIVE(0), .N_RANDOM(N_POST_RANDOM)) p5 (.done(po_done[5]), .errs(po_errs[5*32 +: 32]), .nvec(po_n[5*32 +: 32]));
+
+    // 3. end-to-end
+    sign_chain_check #(.XLEN(XLEN_EXH),  .NEG_STYLE("CARRY_CHAIN"), .MODE(0)) h0 (.done(ch_done[0]), .errs(ch_errs[0*32 +: 32]), .nvec(ch_n[0*32 +: 32]));
+    sign_chain_check #(.XLEN(XLEN_EXH_PT),  .NEG_STYLE("PREFIX_TREE"), .MODE(0)) h1 (.done(ch_done[1]), .errs(ch_errs[1*32 +: 32]), .nvec(ch_n[1*32 +: 32]));
+    sign_chain_check #(.XLEN(16), .NEG_STYLE("CARRY_CHAIN"), .MODE(1), .N_SHAPED(N16), .N_RANDOM(N16 / 2)) h2 (.done(ch_done[2]), .errs(ch_errs[2*32 +: 32]), .nvec(ch_n[2*32 +: 32]));
+    sign_chain_check #(.XLEN(16), .NEG_STYLE("PREFIX_TREE"), .MODE(1), .N_SHAPED(N16), .N_RANDOM(N16 / 2)) h3 (.done(ch_done[3]), .errs(ch_errs[3*32 +: 32]), .nvec(ch_n[3*32 +: 32]));
+    sign_chain_check #(.XLEN(64), .NEG_STYLE("CARRY_CHAIN"), .MODE(2), .N_SHAPED(N64_SHAPED), .N_RANDOM(N64_RANDOM), .FRONT(1)) h4 (.done(ch_done[4]), .errs(ch_errs[4*32 +: 32]), .nvec(ch_n[4*32 +: 32]));
+    sign_chain_check #(.XLEN(64), .NEG_STYLE("PREFIX_TREE"), .MODE(2), .N_SHAPED(N64_SHAPED), .N_RANDOM(N64_RANDOM), .FRONT(1)) h5 (.done(ch_done[5]), .errs(ch_errs[5*32 +: 32]), .nvec(ch_n[5*32 +: 32]));
+
+    function automatic integer sum32(input logic [32*16-1:0] bus, input int n);
+        integer s, q;
+        begin
+            s = 0;
+            for (q = 0; q < n; q = q + 1) s = s + bus[q*32 +: 32];
+            sum32 = s;
+        end
+    endfunction
+
+    integer e_cn, e_po, e_ch, n_cn, n_po, n_ch;
+    initial begin
+        $dumpfile("tb_sign_handling.vcd");
+        $dumpvars(1, tb_sign_handling);
+        wait (&cn_done && &po_done && &ch_done);
+        #1;
+        e_cn = sum32(cn_errs, NCN);
+        n_cn = sum32(cn_n,    NCN);
+        e_po = sum32(po_errs, NPO);
+        n_po = sum32(po_n,    NPO);
+        e_ch = sum32(ch_errs, NCH);
+        n_ch = sum32(ch_n,    NCH);
+        if (e_cn + e_po + e_ch == 0)
+            $display("PASS: sign handling - %0d conditional_negate vectors (exhaustive W=1/2/5/8/13, directed+random W=33/64, both styles), %0d sign_poststage vectors (exhaustive XLEN=4/6, directed+random XLEN=64), %0d end-to-end MUL/MULH/MULHSU/MULHU vectors (exhaustive at XLEN=%0d for CARRY_CHAIN and XLEN=%0d for PREFIX_TREE; XLEN=16 random; XLEN=64 directed+shaped+random with precision_detector and operand_isolation in the path) all match the golden RV64M model; every (op, level) pair covered.",
+                     n_cn, n_po, n_ch, XLEN_EXH, XLEN_EXH_PT);
+        else
+            $display("FAIL: sign handling - errors: conditional_negate %0d, sign_poststage %0d, end-to-end %0d.", e_cn, e_po, e_ch);
+        $finish;
+    end
+
+endmodule
