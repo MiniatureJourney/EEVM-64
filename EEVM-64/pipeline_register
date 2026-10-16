@@ -1,0 +1,67 @@
+// =============================================================================
+// Module   : pipeline_register
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.9 (ports) and §3 (cut points)
+// Level    : Sequential — one register slice, 1 cycle of latency
+//
+// Function : q <= d on a rising clk edge when en = 1; q holds when en = 0.
+//            rst_n is an asynchronous, active-low reset that forces q to RESET_VAL
+//            and has priority over en. Nothing else in the multiplier hierarchy is
+//            clocked: this is the only sequential module, instantiated once per
+//            signal group at each pipeline cut point.
+//
+// Parameters:
+//   W          width of the slice
+//   RESET_EN   1 (default) : q is reset to RESET_VAL by rst_n
+//              0           : no reset on this slice (rst_n is ignored)
+//   RESET_VAL  value q takes while rst_n = 0 (default all zeros)
+//
+// How the top level should use it (docs/phase2_design_decisions.md D10):
+//   * VALID bit  : W = 1, RESET_EN = 1, en = 1'b1. It must be reset (so no stale
+//                  "valid" survives a reset) and must be enabled every cycle so a
+//                  request keeps moving through the pipe even when the stage before
+//                  it is idle.
+//   * DATA rows  : RESET_EN = 0, en = the valid bit that feeds the stage. A flop
+//                  without a reset is smaller and its clear net disappears; the
+//                  valid bit already tells the consumer whether q means anything.
+//                  Holding q on an idle cycle (en = 0) keeps the combinational
+//                  logic after it quiet — no new operand, no switching — which is
+//                  exactly the power the pipeline's clock enables are there to save.
+//   * An un-reset slice shows X in simulation until its first capture. That is
+//     expected; read it only while the matching valid bit is 1.
+//
+// Clock gating: the enable is modelled as a clock-enable (flop with CE), NOT as a
+// gated clock — Phase 1 §7 leaves the ICG cell mapping to the synthesis flow.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module pipeline_register #(
+    parameter int           W         = 1,
+    parameter int           RESET_EN  = 1,
+    parameter logic [W-1:0] RESET_VAL = '0
+) (
+    input  logic         clk,
+    input  logic         rst_n,
+    input  logic         en,
+    input  logic [W-1:0] d,
+    output logic [W-1:0] q
+);
+
+    generate
+        if (RESET_EN != 0) begin : g_reset
+            always_ff @(posedge clk or negedge rst_n) begin
+                if (!rst_n)  q <= RESET_VAL;
+                else if (en) q <= d;
+            end
+        end else begin : g_no_reset
+            always_ff @(posedge clk) begin
+                if (en) q <= d;
+            end
+
+            // rst_n is deliberately unused when there is no reset on this slice
+            logic unused_ok;
+            assign unused_ok = &{1'b0, rst_n};
+        end
+    endgenerate
+
+endmodule
