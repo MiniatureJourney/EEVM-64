@@ -1,0 +1,295 @@
+// =============================================================================
+// Testbench : tb_pipeline_register
+// DUT       : pipeline_register (4 configurations + 2 small structures built from it)
+// Spec ref  : EEVM-64_architecturePlan.pdf §2.9 (clk, rst_n, en, d, q) and §3
+//
+// Configurations under test (all share clk, rst_n and en):
+//   A  W = 1,   RESET_EN = 1, RESET_VAL = 0       the "valid bit" slice
+//   B  W = 8,   RESET_EN = 1, RESET_VAL = 8'hA5   non-zero reset value
+//   C  W = 130, RESET_EN = 1, RESET_VAL = all 1s  wide, odd width (carry-save rows)
+//   D  W = 64,  RESET_EN = 0                      datapath slice, no reset
+//   chain : three W = 8 slices in series, en = 1  -> output = input three edges ago
+//   pipe  : the intended 2-stage use — a valid bit (reset, en = 1) beside data slices
+//           (no reset, en = the valid bit feeding that stage); data must hold on
+//           idle cycles and arrive with its valid bit exactly 2 edges later.
+//
+// Expected values are tracked in the testbench as plain variables, updated by
+// ordinary assignments from the stimulus (never by instantiating the DUT's own
+// always_ff), and compared with !== so an X or Z on q is a failure.
+//
+// Checks on every cycle, at four moments:
+//   * 2 ns after inputs change, BEFORE the clock edge — q must not have moved,
+//     except that an asserted rst_n must already have forced the reset value
+//     (asynchronous reset);
+//   * 1 ns after the clock edge — q must hold the new expected value
+//     (capture when en = 1, hold when en = 0, reset value while rst_n = 0, reset
+//     winning over en);
+//   * after d and en are scrambled while the clock is high — q must not move
+//     (no transparency, nothing but the edge loads the register);
+//   * around an optional rst_n pulse that lies between two edges — q is cleared at
+//     once, and releasing rst_n without a clock edge captures nothing.
+// Slice D is checked to ignore rst_n completely and, until its first capture, only
+// its first load makes it comparable (it powers up unknown).
+//
+// Pass/fail : prints one PASS/FAIL summary line for testingDataBlockwise.
+// =============================================================================
+`timescale 1ns / 1ps
+
+module tb_pipeline_register #(
+    parameter int N_RANDOM = 20000      // random cycles
+);
+
+    // ---- clock: 10 ns period, rising edges at 5, 15, 25 ... ns ------------------
+    logic clk;
+    initial clk = 1'b0;
+    always #5 clk = ~clk;
+
+    logic         rst_n, en;
+    logic [255:0] dbus;       // random data; every instance reads its own slice
+
+    // slices of dbus:  A [0]   B [8:1]   C [138:9]   D [202:139]
+    //                  chain [210:203]   pipe_valid [211]   pipe_data [227:212]
+    logic         qa;
+    logic [7:0]   qb;
+    logic [129:0] qc;
+    logic [63:0]  qd;
+
+    pipeline_register #(.W(1),   .RESET_EN(1), .RESET_VAL(1'b0))
+        dut_a (.clk(clk), .rst_n(rst_n), .en(en), .d(dbus[0]),       .q(qa));
+    pipeline_register #(.W(8),   .RESET_EN(1), .RESET_VAL(8'hA5))
+        dut_b (.clk(clk), .rst_n(rst_n), .en(en), .d(dbus[8:1]),     .q(qb));
+    pipeline_register #(.W(130), .RESET_EN(1), .RESET_VAL('1))
+        dut_c (.clk(clk), .rst_n(rst_n), .en(en), .d(dbus[138:9]),   .q(qc));
+    pipeline_register #(.W(64),  .RESET_EN(0))
+        dut_d (.clk(clk), .rst_n(rst_n), .en(en), .d(dbus[202:139]), .q(qd));
+
+    // chain of three
+    logic [7:0] c0, c1, c2;
+    pipeline_register #(.W(8), .RESET_EN(1)) u_c0 (.clk(clk), .rst_n(rst_n), .en(1'b1), .d(dbus[210:203]), .q(c0));
+    pipeline_register #(.W(8), .RESET_EN(1)) u_c1 (.clk(clk), .rst_n(rst_n), .en(1'b1), .d(c0),            .q(c1));
+    pipeline_register #(.W(8), .RESET_EN(1)) u_c2 (.clk(clk), .rst_n(rst_n), .en(1'b1), .d(c1),            .q(c2));
+
+    // two-stage valid + data pipe
+    logic        v_in, v1, v2;
+    logic [15:0] din, d1, d2;
+    assign v_in = dbus[211];
+    assign din  = dbus[227:212];
+    pipeline_register #(.W(1),  .RESET_EN(1)) u_v1 (.clk(clk), .rst_n(rst_n), .en(1'b1), .d(v_in), .q(v1));
+    pipeline_register #(.W(1),  .RESET_EN(1)) u_v2 (.clk(clk), .rst_n(rst_n), .en(1'b1), .d(v1),   .q(v2));
+    pipeline_register #(.W(16), .RESET_EN(0)) u_d1 (.clk(clk), .rst_n(rst_n), .en(v_in), .d(din),  .q(d1));
+    pipeline_register #(.W(16), .RESET_EN(0)) u_d2 (.clk(clk), .rst_n(rst_n), .en(v1),   .d(d1),   .q(d2));
+
+    // ---- expected state ---------------------------------------------------------------
+    logic         exp_a;
+    logic [7:0]   exp_b;
+    logic [129:0] exp_c;
+    logic [63:0]  exp_d;      logic known_d;
+    logic [7:0]   exp_c0, exp_c1, exp_c2;
+    logic         exp_v1, exp_v2;
+    logic [15:0]  exp_d1, exp_d2;   logic known_d1, known_d2;
+
+    // independent latency check (phase 3)
+    logic         last_vin;  logic [15:0] last_din;
+    logic         check_latency;
+
+    integer errors, n_cycles, n_checks, n_pulses, n_resets;
+
+    task automatic fail(input string where_, input string what);
+        begin
+            errors = errors + 1;
+            if (errors <= 12) $display("FAIL [%s] %s  (t=%0t)", where_, what, $time);
+        end
+    endtask
+
+    task automatic compare_all(input string where_);
+        begin
+            n_checks = n_checks + 1;
+            if (qa !== exp_a) fail(where_, $sformatf("A: q=%b expected %b", qa, exp_a));
+            if (qb !== exp_b) fail(where_, $sformatf("B: q=%h expected %h", qb, exp_b));
+            if (qc !== exp_c) fail(where_, $sformatf("C: q=%h expected %h", qc, exp_c));
+            if (known_d && (qd !== exp_d)) fail(where_, $sformatf("D: q=%h expected %h", qd, exp_d));
+            if (c0 !== exp_c0 || c1 !== exp_c1 || c2 !== exp_c2)
+                fail(where_, $sformatf("chain: %h %h %h expected %h %h %h", c0, c1, c2, exp_c0, exp_c1, exp_c2));
+            if (v1 !== exp_v1 || v2 !== exp_v2)
+                fail(where_, $sformatf("valid: v1=%b v2=%b expected %b %b", v1, v2, exp_v1, exp_v2));
+            if (known_d1 && (d1 !== exp_d1)) fail(where_, $sformatf("pipe d1=%h expected %h", d1, exp_d1));
+            if (known_d2 && (d2 !== exp_d2)) fail(where_, $sformatf("pipe d2=%h expected %h", d2, exp_d2));
+        end
+    endtask
+
+    // the reset values, applied to every slice that has a reset
+    task automatic apply_reset_model();
+        begin
+            exp_a = 1'b0;  exp_b = 8'hA5;  exp_c = '1;
+            exp_c0 = 8'h00; exp_c1 = 8'h00; exp_c2 = 8'h00;
+            exp_v1 = 1'b0;  exp_v2 = 1'b0;
+            n_resets = n_resets + 1;
+        end
+    endtask
+
+    // One clock cycle. Called any time before a falling edge; returns after the next
+    // rising edge (plus the optional mid-cycle activity), still before the next falling edge.
+    task automatic step(
+        input logic [255:0] dv,         // data for this cycle
+        input logic         e,          // enable for this cycle
+        input logic         r_n,        // rst_n for this cycle (0 = held low across the edge)
+        input logic         scramble,   // scramble d/en while the clock is high
+        input logic         pulse       // rst_n pulse between the edges
+    );
+        logic [255:0] junk;
+        logic         v1_at_edge, known1_old;
+        logic [15:0]  d1_old;
+        logic         vin_now;
+        logic [15:0]  din_now;
+        begin
+            @(negedge clk);                 // t0
+            #1;                             // t0+1 : apply inputs
+            dbus = dv; en = e; rst_n = r_n;
+            vin_now = dv[211];
+            din_now = dv[227:212];
+            #1;                             // t0+2 : pre-edge check
+            if (!r_n) apply_reset_model();  // asynchronous reset acts immediately (slices with a reset)
+            compare_all("pre-edge");
+
+            @(posedge clk);                 // t0+5
+            #1;                             // t0+6 : post-edge check
+
+            // ---- expected state after the edge, from the state just BEFORE it
+            // (a low rst_n was already applied to the reset-capable slices at t0+2)
+            v1_at_edge = exp_v1;                 // the v1 that enables d2 at this edge
+            d1_old     = exp_d1;
+            known1_old = known_d1;
+            if (r_n) begin
+                if (e) begin                     // A, B, C: capture when en = 1, else hold
+                    exp_a = dv[0];  exp_b = dv[8:1];  exp_c = dv[138:9];
+                end
+                exp_c2 = exp_c1;  exp_c1 = exp_c0;  exp_c0 = dv[210:203];   // chain: en = 1
+                exp_v2 = v1_at_edge;  exp_v1 = vin_now;                      // valid bits: en = 1
+            end
+            if (e) begin                         // D has no reset: loads whenever en = 1
+                exp_d = dv[202:139];  known_d = 1'b1;
+            end
+            if (v1_at_edge) begin exp_d2 = d1_old;   known_d2 = known1_old; end  // pipe data: no reset
+            if (vin_now)    begin exp_d1 = din_now;  known_d1 = 1'b1;       end
+            n_cycles = n_cycles + 1;
+            compare_all("post-edge");
+
+            // independent latency property (valid only while rst_n stays high): after this
+            // edge v2 must equal the v_in seen one edge earlier, and carry that din
+            if (check_latency && r_n) begin
+                if (v2 !== last_vin) fail("latency", $sformatf("v2=%b but v_in one edge earlier was %b", v2, last_vin));
+                if (v2 === 1'b1 && d2 !== last_din)
+                    fail("latency", $sformatf("d2=%h but din one edge earlier was %h", d2, last_din));
+            end
+            last_vin = vin_now;
+            last_din = din_now;
+
+            // scramble d and en while the clock is high: q may not move
+            if (scramble) begin
+                #1;                         // t0+7
+                junk = {$urandom, $urandom, $urandom, $urandom, $urandom, $urandom, $urandom, $urandom};
+                dbus = junk;  en = ~e;
+                #0.5;                       // t0+7.5
+                compare_all("scramble");
+            end
+
+            // asynchronous rst_n pulse between the edges
+            if (pulse) begin
+                #0.5;                       // t0+8
+                rst_n = 1'b0;
+                #0.5;                       // t0+8.5 : cleared with no clock edge
+                apply_reset_model();
+                n_pulses = n_pulses + 1;
+                compare_all("async-pulse");
+                #0.5;                       // t0+9
+                rst_n = 1'b1;
+                #0.5;                       // t0+9.5 : releasing rst_n must capture nothing
+                compare_all("async-release");
+            end
+        end
+    endtask
+
+    // ---- helpers ----------------------------------------------------------------------
+    function automatic logic [255:0] rnd256();
+        rnd256 = {$urandom, $urandom, $urandom, $urandom, $urandom, $urandom, $urandom, $urandom};
+    endfunction
+
+    integer i;
+    logic [255:0] pat;
+
+    initial begin
+        $dumpfile("tb_pipeline_register.vcd");
+        $dumpvars(0, tb_pipeline_register);
+
+        errors = 0; n_cycles = 0; n_checks = 0; n_pulses = 0; n_resets = 0;
+        known_d = 1'b0; known_d1 = 1'b0; known_d2 = 1'b0;
+        check_latency = 1'b0; last_vin = 1'b0; last_din = 16'h0000;
+        exp_d = '0; exp_d1 = '0; exp_d2 = '0;
+        apply_reset_model();
+        n_resets = 0;
+
+        // ---- phase 0: power-up and reset. rst_n starts high so the first fall is a real edge.
+        rst_n = 1'b1; en = 1'b0; dbus = '0;
+        #1;
+        rst_n = 1'b0;                       // asynchronous: acts at once, before any clock edge
+        #1;
+        compare_all("reset@t=2");
+        #14;                                // across the rising edges at 5 and 15 ns
+        compare_all("reset-held");
+        #1;
+        rst_n = 1'b1;                       // release between edges
+        #0.5;
+        compare_all("reset-released");
+
+        // ---- phase 1: directed sequences (each line is one clock cycle)
+        pat = {32{8'hC3}};
+        step(pat,  1'b0, 1'b1, 1'b0, 1'b0);   // en = 0: nothing is captured
+        step(pat,  1'b1, 1'b1, 1'b0, 1'b0);   // en = 1: captured
+        step(~pat, 1'b0, 1'b1, 1'b0, 1'b0);   // en = 0: holds the previous value
+        step(~pat, 1'b0, 1'b1, 1'b0, 1'b0);
+        step(~pat, 1'b1, 1'b0, 1'b0, 1'b0);   // reset low across an edge WITH en = 1: reset wins
+        step(pat,  1'b1, 1'b1, 1'b0, 1'b0);   // first edge after reset releases
+        step('0,   1'b1, 1'b1, 1'b0, 1'b0);   // all zeros
+        step('1,   1'b1, 1'b1, 1'b0, 1'b0);   // all ones
+        step(pat,  1'b1, 1'b1, 1'b1, 1'b0);   // d/en scrambled while the clock is high
+        step(~pat, 1'b1, 1'b1, 1'b0, 1'b1);   // rst_n pulse between edges
+        step(pat,  1'b1, 1'b0, 1'b0, 1'b0);   // multi-cycle reset: 3 edges low
+        step(pat,  1'b1, 1'b0, 1'b0, 1'b0);
+        step(~pat, 1'b0, 1'b0, 1'b0, 1'b0);
+        step(~pat, 1'b1, 1'b1, 1'b0, 1'b0);
+        for (i = 0; i < 64; i = i + 1)        // walking one across every slice (dbus bit i)
+            step(256'd1 << (i * 3 % 256), 1'b1, 1'b1, 1'b0, 1'b0);
+        for (i = 0; i < 64; i = i + 1)        // walking zero
+            step(~(256'd1 << (i * 3 % 256)), 1'b1, 1'b1, 1'b0, 1'b0);
+
+        // ---- phase 2: random
+        for (i = 0; i < N_RANDOM; i = i + 1)
+            step(rnd256(),
+                 ($urandom % 2) == 0,           // en 50 %
+                 ($urandom % 32) != 0,          // rst_n low on ~3 % of cycles
+                 ($urandom % 2) == 0,           // scramble while clk high
+                 ($urandom % 20) == 0);         // rst_n pulse between edges
+
+        // ---- phase 3: latency property of the valid/data pipe, rst_n held high.
+        // Flush the pipe with three idle cycles (v_in = 0), then check latency independently.
+        for (i = 0; i < 3; i = i + 1) begin
+            pat = rnd256();
+            pat[211] = 1'b0;
+            step(pat, 1'b1, 1'b1, 1'b0, 1'b0);
+        end
+        check_latency = 1'b1;
+        pat = rnd256(); pat[211] = 1'b0;
+        step(pat, 1'b1, 1'b1, 1'b0, 1'b0);      // sets last_vin = 0 for the first check
+        for (i = 0; i < 3000; i = i + 1)
+            step(rnd256(), ($urandom % 2) == 0, 1'b1, ($urandom % 2) == 0, 1'b0);
+
+        #1;
+        if (errors == 0)
+            $display("PASS: pipeline_register - %0d cycles, %0d checks on 4 configurations (W=1/8/130 with reset, W=64 without) + 3-deep chain + valid/data pipe: capture on en, hold on !en, async reset (%0d reset events, %0d mid-cycle pulses), reset priority over en, no capture on reset release, no transparency, exact 2-edge latency.",
+                     n_cycles, n_checks, n_resets, n_pulses);
+        else
+            $display("FAIL: pipeline_register - %0d mismatches in %0d cycles.", errors, n_cycles);
+        $finish;
+    end
+
+endmodule
