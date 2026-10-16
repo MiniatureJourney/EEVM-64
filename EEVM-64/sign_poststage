@@ -1,0 +1,47 @@
+// =============================================================================
+// Module   : sign_poststage
+// Project  : EEVM-64 — Energy-Efficient Vedic Multiplier for 64-bit RISC-V
+// Spec ref : EEVM-64_architecturePlan.pdf, §2.3 "Post-stage" and §3 (Stage B:
+//            "sign post-stage (negate if needed) -> op_sel mux to 64-bit result")
+// Level    : Combinational (lives in pipeline Stage B, after the final adder)
+//
+// Function : result = the selected 64-bit half of (neg ? -p : p), p = the 128-bit
+//            unsigned product of the two magnitudes.
+//
+// Optimisation: the spec negates the whole 128-bit product and then muxes a half out.
+//            Here the half is selected FIRST and only 64 bits are negated:
+//              * low half  : -p mod 2^64 depends on p[63:0] alone;
+//              * high half : the high bits of -p are ~p[127:64] plus a carry that is
+//                1 only when the low half is zero, so negating it needs just the
+//                high half and one extra bit, low_nz = (p[63:0] != 0).
+//            That halves the negator (one 64-bit slice instead of 128 bits) and the
+//            low-half path (MUL) never exercises the other half at all.
+//            Proved equal to "negate 128 bits, then slice" over all inputs
+//            (formal/run_blocks_12_13.sh).
+//
+// Inputs neg and hi come from sign_prestage, carried through the pipeline register
+// (two bits, not op_sel + two sign bits).
+// =============================================================================
+`timescale 1ns / 1ps
+
+module sign_poststage #(
+    parameter int    XLEN      = 64,
+    parameter     NEG_STYLE = "CARRY_CHAIN"    // "CARRY_CHAIN" | "PREFIX_TREE" (conditional_negate)
+) (
+    input  logic [2*XLEN-1:0] p,             // unsigned product of the magnitudes
+    input  logic              neg,
+    input  logic              hi,
+    output logic [XLEN-1:0]   result
+);
+
+    logic [XLEN-1:0] half;
+    logic            low_nz;
+
+    assign half   = hi ? p[2*XLEN-1:XLEN] : p[XLEN-1:0];
+    assign low_nz = hi & (|p[XLEN-1:0]);
+
+    conditional_negate #(.W(XLEN), .STYLE(NEG_STYLE)) u_neg (
+        .x(half), .neg(neg), .low_nz(low_nz), .y(result)
+    );
+
+endmodule
