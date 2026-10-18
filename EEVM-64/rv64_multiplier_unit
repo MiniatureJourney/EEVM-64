@@ -1,0 +1,212 @@
+`timescale 1ns / 1ps
+
+// =============================================================================
+// Module   : rv64_multiplier_unit
+// Project  : EEVM-64
+// Phase    : Phase 2, Block 14
+// Purpose  : RV64 M-extension-compatible multiplication unit.
+//
+// Default configuration is the requested Phase-2 target:
+//   PIPELINE_STAGES = 2
+//   ADDER_TYPE      = "BRENT_KUNG"
+//   COMBINE         = "CSA_3TO2" (the current recursive vedic_multiplier default)
+//
+// Operations (op_sel):
+//   2'b00 MUL    : lower 64 product bits; signedness is immaterial to this slice.
+//   2'b01 MULH   : upper 64 bits of signed x signed product.
+//   2'b10 MULHSU : upper 64 bits of signed x unsigned product.
+//   2'b11 MULHU  : upper 64 bits of unsigned x unsigned product.
+//
+// Integration notes:
+// - `vedic_64x64` returns a completed 128-bit unsigned magnitude product. As a
+//   result, Stage 1 registers that product; Stage 2 performs conditional two's-
+//   complement correction and selects the architecturally required 64-bit slice.
+// - Magnitude conversion precedes precision detection/isolation. Applying the
+//   unsigned isolation mask to raw negative two's-complement inputs would clear
+//   sign-extension bits and corrupt the value.
+// - The `pipeline_register.en` inputs are clock-enable controls, not raw gated
+//   clocks. Mapping to integrated clock-gating cells belongs in the later ASIC flow.
+// - This module is fully pipelined: it accepts one request each cycle; there is no
+//   ready/backpressure, stall, or flush interface.
+// =============================================================================
+
+module rv64_multiplier_unit #(
+    parameter int PIPELINE_STAGES = 2,
+    parameter     ADDER_TYPE      = "BRENT_KUNG", // "BRENT_KUNG" | "KOGGE_STONE"
+    parameter     COMBINE         = "CSA_3TO2"    // "CSA_3TO2" | "COMP_4TO2"
+) (
+    input  logic        clk,
+    input  logic        rst_n,       // asynchronous, active-low reset
+    input  logic        valid_in,    // request strobe; accepts one request/cycle
+    input  logic [1:0]  op_sel,
+    input  logic [63:0] rs1,
+    input  logic [63:0] rs2,
+    output logic        valid_out,
+    output logic [63:0] result
+);
+
+    localparam logic [1:0] OP_MUL    = 2'b00;
+    localparam logic [1:0] OP_MULH   = 2'b01;
+    localparam logic [1:0] OP_MULHSU = 2'b10;
+    localparam logic [1:0] OP_MULHU  = 2'b11;
+
+    // Operand isolation while idle: changing external operands do not propagate
+    // into the magnitude converter, precision detector, or multiplier tree unless
+    // a request is being accepted.
+    logic [63:0] req_a, req_b;
+    assign req_a = valid_in ? rs1 : 64'b0;
+    assign req_b = valid_in ? rs2 : 64'b0;
+
+    logic signed_a, signed_b;
+    logic neg_a, neg_b, negate_product_comb;
+    logic [63:0] mag_a, mag_b;
+
+    // MUL only observes the low half, whose bits are identical for signed and
+    // unsigned interpretations. Keep MUL on the unsigned path. MULH is S x S;
+    // MULHSU is S x U; MULHU is U x U.
+    always_comb begin
+        signed_a = 1'b0;
+        signed_b = 1'b0;
+        case (op_sel)
+            OP_MULH: begin
+                signed_a = 1'b1;
+                signed_b = 1'b1;
+            end
+            OP_MULHSU: begin
+                signed_a = 1'b1;
+                signed_b = 1'b0;
+            end
+            default: begin
+                signed_a = 1'b0;
+                signed_b = 1'b0;
+            end
+        endcase
+
+        neg_a = signed_a && req_a[63];
+        neg_b = signed_b && req_b[63];
+        mag_a = neg_a ? ((~req_a) + 64'd1) : req_a;
+        mag_b = neg_b ? ((~req_b) + 64'd1) : req_b;
+        negate_product_comb = neg_a ^ neg_b;
+    end
+
+    logic [1:0] precision_level;
+    logic [63:0] a_iso, b_iso;
+    logic [127:0] product_mag_comb;
+
+    // Since sign handling has already converted signed operands to non-negative
+    // magnitudes, precision detection is performed in unsigned mode. This is also
+    // correct for MULHSU because the two operands are independently normalized.
+    precision_detector u_precision_detector (
+        .a        (mag_a),
+        .b        (mag_b),
+        .is_signed(1'b0),
+        .level    (precision_level)
+    );
+
+    operand_isolation u_operand_isolation (
+        .a     (mag_a),
+        .b     (mag_b),
+        .level (precision_level),
+        .a_iso (a_iso),
+        .b_iso (b_iso)
+    );
+
+    vedic_64x64 #(
+        .ADDER_TYPE(ADDER_TYPE),
+        .COMBINE   (COMBINE)
+    ) u_vedic_64x64 (
+        .a(a_iso),
+        .b(b_iso),
+        .p(product_mag_comb)
+    );
+
+    // Stage 1: register the complete unsigned magnitude product and metadata.
+    logic [127:0] product_mag_s1;
+    logic         negate_s1;
+    logic [1:0]   op_sel_s1;
+    logic         valid_s1;
+
+    pipeline_register #(.W(128), .RESET_EN(1), .RESET_VAL(128'b0)) u_product_s1 (
+        .clk(clk), .rst_n(rst_n), .en(valid_in), .d(product_mag_comb), .q(product_mag_s1)
+    );
+    pipeline_register #(.W(1), .RESET_EN(1), .RESET_VAL(1'b0)) u_negate_s1 (
+        .clk(clk), .rst_n(rst_n), .en(valid_in), .d(negate_product_comb), .q(negate_s1)
+    );
+    pipeline_register #(.W(2), .RESET_EN(1), .RESET_VAL(2'b0)) u_op_sel_s1 (
+        .clk(clk), .rst_n(rst_n), .en(valid_in), .d(op_sel), .q(op_sel_s1)
+    );
+    // Valid must advance even during bubbles, so its enable is permanently high.
+    pipeline_register #(.W(1), .RESET_EN(1), .RESET_VAL(1'b0)) u_valid_s1 (
+        .clk(clk), .rst_n(rst_n), .en(1'b1), .d(valid_in), .q(valid_s1)
+    );
+
+    // Exact 128-bit two's-complement correction after the unsigned magnitude tree.
+    logic [127:0] product_signed_s1;
+    assign product_signed_s1 = negate_s1 ? ((~product_mag_s1) + 128'd1) : product_mag_s1;
+
+    function automatic logic [63:0] select_product_slice(
+        input logic [127:0] product,
+        input logic [1:0]   operation
+    );
+        begin
+            case (operation)
+                OP_MUL:    select_product_slice = product[63:0];
+                OP_MULH:   select_product_slice = product[127:64];
+                OP_MULHSU: select_product_slice = product[127:64];
+                OP_MULHU:  select_product_slice = product[127:64];
+                default:   select_product_slice = 64'b0;
+            endcase
+        end
+    endfunction
+
+    logic [63:0] result_s1;
+    assign result_s1 = select_product_slice(product_signed_s1, op_sel_s1);
+
+    generate
+        if (PIPELINE_STAGES == 2) begin : g_pipe2
+            // Stage 2: signed correction is already combinational above; capture the
+            // selected result and matching valid bit here.
+            pipeline_register #(.W(64), .RESET_EN(1), .RESET_VAL(64'b0)) u_result_s2 (
+                .clk(clk), .rst_n(rst_n), .en(valid_s1), .d(result_s1), .q(result)
+            );
+            pipeline_register #(.W(1), .RESET_EN(1), .RESET_VAL(1'b0)) u_valid_out_s2 (
+                .clk(clk), .rst_n(rst_n), .en(1'b1), .d(valid_s1), .q(valid_out)
+            );
+        end else if (PIPELINE_STAGES == 3) begin : g_pipe3
+            // Optional 3-stage variant: Stage 2 captures the signed 128-bit product;
+            // Stage 3 selects the architectural slice. The current roadmap target is
+            // the 2-stage configuration; this branch preserves the spec's parameter.
+            logic [127:0] product_signed_s2;
+            logic [1:0]   op_sel_s2;
+            logic         valid_s2;
+            logic [63:0]  result_s2;
+
+            pipeline_register #(.W(128), .RESET_EN(1), .RESET_VAL(128'b0)) u_signed_product_s2 (
+                .clk(clk), .rst_n(rst_n), .en(valid_s1), .d(product_signed_s1), .q(product_signed_s2)
+            );
+            pipeline_register #(.W(2), .RESET_EN(1), .RESET_VAL(2'b0)) u_op_sel_s2 (
+                .clk(clk), .rst_n(rst_n), .en(valid_s1), .d(op_sel_s1), .q(op_sel_s2)
+            );
+            pipeline_register #(.W(1), .RESET_EN(1), .RESET_VAL(1'b0)) u_valid_s2 (
+                .clk(clk), .rst_n(rst_n), .en(1'b1), .d(valid_s1), .q(valid_s2)
+            );
+
+            assign result_s2 = select_product_slice(product_signed_s2, op_sel_s2);
+            pipeline_register #(.W(64), .RESET_EN(1), .RESET_VAL(64'b0)) u_result_s3 (
+                .clk(clk), .rst_n(rst_n), .en(valid_s2), .d(result_s2), .q(result)
+            );
+            pipeline_register #(.W(1), .RESET_EN(1), .RESET_VAL(1'b0)) u_valid_out_s3 (
+                .clk(clk), .rst_n(rst_n), .en(1'b1), .d(valid_s2), .q(valid_out)
+            );
+        end else begin : g_invalid_pipeline_parameter
+            // Invalid configurations fail loudly in simulation rather than silently
+            // claiming the requested latency.
+            initial $error("rv64_multiplier_unit: PIPELINE_STAGES must be 2 or 3");
+            always_comb begin
+                valid_out = 1'b0;
+                result    = 64'b0;
+            end
+        end
+    endgenerate
+
+endmodule
